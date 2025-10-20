@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Heurix - AI-Powered UX Auditor</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="container">
+      <!-- Header Section -->
+      <header class="header">
+        <div class="logo-section">
+          <svg
+            class="logo-icon"
+            width="40"
+            height="40"
+            viewBox="0 0 40 40"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path d="M8 20L12 16L16 20L12 24L8 20Z" fill="white" />
+            <path d="M12 12L16 8L20 12L16 16L12 12Z" fill="white" />
+            <path d="M16 20L20 16L24 20L20 24L16 20Z" fill="white" />
+            <path d="M20 12L24 8L28 12L24 16L20 12Z" fill="white" />
+          </svg>
+          <h1 class="title">Heurix</h1>
+        </div>
+        <svg
+          class="lightning-icon"
+          width="28"
+          height="28"
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path
+            d="M13 2L3 14H12L11 22L21 10H12L13 2Z"
+            fill="#FFD700"
+            stroke="#FFD700"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </header>
+
+      <p class="subtitle">AI-Powered UX Auditor</p>
+
+      <!-- Main Action Button -->
+      <button class="analyze-button" id="analyzeBtn">
+        <svg
+          class="button-icon"
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path d="M8 20L12 16L16 20L12 24L8 20Z" fill="white" />
+          <path d="M12 12L16 8L20 12L16 16L12 12Z" fill="white" />
+        </svg>
+        <span>Analyze Current Page</span>
+      </button>
+
+      <!-- Instruction Text -->
+      <p class="instruction-text">
+        Click the button above to analyze the current page<br />
+        for UX issues
+      </p>
+
+      <!-- Results (hidden until analysis completes) -->
+      <div id="results" class="results hidden">
+        <!-- URL Card -->
+        <div class="url-card">
+          <div class="url-icon">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2Z"
+                stroke="#7c3aed"
+                stroke-width="1.5"
+              />
+              <path
+                d="M2 12h20M12 2c-2.5 2.7-4 6.2-4 10s1.5 7.3 4 10c2.5-2.7 4-6.2 4-10S14.5 4.7 12 2Z"
+                stroke="#7c3aed"
+                stroke-width="1.5"
+              />
+            </svg>
+          </div>
+          <div class="url-texts">
+            <div class="url-title">Product Dashboard - Analytics</div>
+            <div class="url-subtitle">
+              https://example.com/dashboard/analytics
+            </div>
+          </div>
+        </div>
+
+        <!-- Score Section -->
+        <div class="score-section">
+          <div class="gauge" aria-label="UX Health Score">
+            <div class="gauge-inner">
+              <div class="score-value">78</div>
+              <div class="score-total">/ 100</div>
+            </div>
+          </div>
+          <div class="score-label">UX Health Score</div>
+        </div>
+
+        <!-- Strengths Panel -->
+        <div class="panel panel--success">
+          <div class="panel-header">
+            <div class="panel-icon">
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  d="M20 6L9 17l-5-5"
+                  stroke="#16a34a"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </div>
+            <div class="panel-title">Strengths</div>
+          </div>
+          <ul class="panel-list">
+            <li class="success">Clear visual hierarchy throughout the page</li>
+            <li class="success">Responsive design adapts well to mobile</li>
+            <li class="success">Fast page load time (1.2s)</li>
+          </ul>
+        </div>
+
+        <!-- Issues Panel -->
+        <div class="panel panel--danger">
+          <div class="panel-header">
+            <div class="panel-icon">
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"
+                  stroke="#ef4444"
+                  stroke-width="1.6"
+                />
+                <path
+                  d="M12 9v4M12 17h.01"
+                  stroke="#ef4444"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </div>
+            <div class="panel-title">Issues Found</div>
+          </div>
+          <ul class="panel-list">
+            <li class="danger">Low contrast text in navigation menu</li>
+            <li class="warning">Missing alt text on 3 images</li>
+            <li class="warning">Touch targets smaller than 44px</li>
+          </ul>
+        </div>
+
+        <!-- Suggestions Panel -->
+        <div class="panel panel--info">
+          <div class="panel-header">
+            <div class="panel-icon">
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path
+                  d="M9 18h6M12 2a7 7 0 0 1 7 7c0 2.5-1.34 4.38-3 5.5-.66.46-1 1.22-1 2v1H9v-1c0-.78-.34-1.54-1-2C6.34 13.38 5 11.5 5 9a7 7 0 0 1 7-7Z"
+                  stroke="#2563eb"
+                  stroke-width="1.6"
+                />
+              </svg>
+            </div>
+            <div class="panel-title">Suggestions</div>
+          </div>
+          <ul class="panel-list">
+            <li class="info">Add ARIA labels to interactive elements</li>
+            <li class="info">Implement keyboard navigation shortcuts</li>
+            <li class="info">
+              Consider adding loading states for async actions
+            </li>
+          </ul>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="action-row">
+          <button class="secondary-button" id="viewDetailsBtn">
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path d="M4 4h16v16H4z" stroke="#374151" stroke-width="1.6" />
+              <path
+                d="M8 8h8M8 12h8M8 16h5"
+                stroke="#374151"
+                stroke-width="1.6"
+                stroke-linecap="round"
+              />
+            </svg>
+            <span>View Details</span>
+          </button>
+          <button class="secondary-button" id="exportBtn">
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M12 16V4M7 9l5-5 5 5"
+                stroke="#374151"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M4 20h16"
+                stroke="#374151"
+                stroke-width="1.6"
+                stroke-linecap="round"
+              />
+            </svg>
+            <span>Export</span>
+          </button>
+        </div>
+
+        <button class="analyze-again-button" id="analyzeAgainBtn">
+          <svg
+            class="button-icon"
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path d="M8 20L12 16L16 20L12 24L8 20Z" fill="white" />
+            <path d="M12 12L16 8L20 12L16 16L12 12Z" fill="white" />
+          </svg>
+          <span>Analyze Again</span>
+        </button>
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
