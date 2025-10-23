@@ -11,6 +11,29 @@
       <!-- Header Section -->
       <header class="header">
         <div class="logo-section">
+          <button
+            id="headerBackBtn"
+            class="back-button"
+            aria-label="Back"
+            title="Back"
+            style="display: none"
+          >
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M15 19l-7-7 7-7"
+                stroke="white"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
           <svg
             class="logo-icon"
             width="40"
@@ -263,6 +286,62 @@
           </svg>
           <span>Analyze Again</span>
         </button>
+      </div>
+
+      <!-- Detailed Analysis View -->
+      <div id="details" class="details hidden">
+        <div class="details-topbar">
+          <div class="details-title">Detailed Analysis</div>
+        </div>
+
+        <div class="url-card">
+          <div class="url-icon">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2Z"
+                stroke="#7c3aed"
+                stroke-width="1.5"
+              />
+              <path
+                d="M2 12h20M12 2c-2.5 2.7-4 6.2-4 10s1.5 7.3 4 10c2.5-2.7 4-6.2 4-10S14.5 4.7 12 2Z"
+                stroke="#7c3aed"
+                stroke-width="1.5"
+              />
+            </svg>
+          </div>
+          <div class="url-texts">
+            <div class="url-title">Current Page</div>
+            <div class="url-subtitle"></div>
+          </div>
+        </div>
+
+        <div class="details-metrics">
+          <div class="metrics-card">
+            <div class="metric">
+              <div class="metric-label">UX Health Score</div>
+              <div class="metric-value">
+                <span class="score-value">0</span>
+                <span class="score-total">/ 100</span>
+              </div>
+            </div>
+            <div class="metric-divider"></div>
+            <div class="metric">
+              <div class="metric-label">Issues Found</div>
+              <div class="metric-value">
+                <span class="issues-count">0</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-heading">All Issues</div>
+        <div id="issuesListDetailed" class="issues-list"></div>
       </div>
     </div>
 
