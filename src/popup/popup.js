@@ -3,16 +3,16 @@ let lastAnalysis; // store the latest parsed analysis for Details view
 
 // Nielsen's 10 Heuristics weights (sum to 1.0)
 const HEURISTIC_WEIGHTS = {
-  1: 0.12, // Visibility of System Status
+  1: 0.13, // Visibility of System Status
   2: 0.1, // Match Between the System and the Real World
-  3: 0.1, // User Control and Freedom
-  4: 0.12, // Consistency and Standards
+  3: 0.11, // User Control and Freedom
+  4: 0.15, // Consistency and Standards
   5: 0.12, // Error Prevention
   6: 0.1, // Recognition Rather than Recall
   7: 0.08, // Flexibility and Efficiency of Use
-  8: 0.08, // Aesthetic and Minimalist Design
+  8: 0.07, // Aesthetic and Minimalist Design
   9: 0.1, // Help Users Recognize, Diagnose, and Recover from Errors
-  10: 0.08, // Help and Documentation
+  10: 0.03, // Help and Documentation
 };
 
 const HEURISTIC_NAMES = {
@@ -187,18 +187,39 @@ document.addEventListener("DOMContentLoaded", function () {
           `[Heurix][Perf] build structured context: size: ${structuredSummary.length} chars`
         );
 
-        const instructions = `
-            
+        const systemInstructions = `You are a UX/UI expert evaluating web pages based on Nielsen's 10 Usability Heuristics.
 
-            Scoring policy (Nielsen's 10 Usability Heuristics):
-            - Use these 10 heuristics with the provided weights (sum = 1.0):
-              ${Object.entries(HEURISTIC_WEIGHTS)
-                .map(([k, w]) => `${k}. ${HEURISTIC_NAMES[k]} — weight ${w}`)
-                .join("\n        ")}
+**Scoring Rules (CRITICAL):**
+1. Calculate the overall usability_score using STRICTLY these weighted heuristics (weights sum to 1.0):
+   ${Object.entries(HEURISTIC_WEIGHTS)
+     .sort(([, a], [, b]) => b - a) // Sort by weight descending
+     .map(([k, w]) => `   ${k}. ${HEURISTIC_NAMES[k]} — weight ${w}`)
+     .join("\n")}
 
-            Return ONLY valid JSON.`;
+2. Score each heuristic from 0-100, then compute: usability_score = Σ(heuristic_score × weight)
 
-        const prompt = `${instructions}\n\nContext:\n${structuredSummary}`;
+**Issue Reporting Rules:**
+1. PRIORITY: Report issues related to HIGH-WEIGHT heuristics FIRST (especially #4, #1, #5, #3)
+2. Return 1-3 most critical issues, sorted by:
+   - First: Heuristic weight (higher weight = higher priority)
+   - Second: Severity (high > medium > low)
+
+**Location Format (CRITICAL for developers):**
+- Be EXTREMELY SPECIFIC and ACTIONABLE
+- Include: CSS selector, element type, visual position, or XPath
+- Good examples:
+  * "Form input '#email' lacks label (line 42, main form)"
+  * "Button '.submit-btn' in header navigation"
+  * "<button class='cta'> in hero section, top-right"
+  * "All <img> tags without alt attributes in gallery grid"
+- Bad examples (too vague):
+  * "Navigation area"
+  * "Some buttons"
+  * "Footer section"
+
+Return ONLY valid JSON with the specified structure.`;
+
+        const prompt = `Context:\n${structuredSummary}`;
 
         // Define JSON schema separately and pass as responseConstraint
         const schema = {
@@ -226,6 +247,11 @@ document.addEventListener("DOMContentLoaded", function () {
                   location: { type: "string", maxLength: 240 },
                   impact: { type: "string", maxLength: 240 },
                   recommendation: { type: "string", maxLength: 240 },
+                  heuristic_number: {
+                    type: "number",
+                    minimum: 1,
+                    maximum: 10,
+                  },
                 },
                 required: [
                   "title",
@@ -235,6 +261,7 @@ document.addEventListener("DOMContentLoaded", function () {
                   "location",
                   "impact",
                   "recommendation",
+                  "heuristic_number",
                 ],
               },
             },
@@ -246,7 +273,12 @@ document.addEventListener("DOMContentLoaded", function () {
         try {
           const params = {
             // control the stability of the model output
-
+            initialPrompts: [
+              {
+                role: "system",
+                content: systemInstructions,
+              },
+            ],
             temperature: 0.4,
             topK: 3,
 
@@ -340,7 +372,23 @@ document.addEventListener("DOMContentLoaded", function () {
             Array.isArray(parsed.issues) &&
             typeof parsed.summary === "string"
           ) {
-            lastAnalysis = parsed;
+            // Sort issues by heuristic weight (higher first), then by severity
+            const sortedIssues = [...parsed.issues].sort((a, b) => {
+              const weightA = HEURISTIC_WEIGHTS[a.heuristic_number] || 0;
+              const weightB = HEURISTIC_WEIGHTS[b.heuristic_number] || 0;
+              if (weightB !== weightA) return weightB - weightA;
+
+              // Secondary sort by severity
+              const severityOrder = { high: 3, medium: 2, low: 1 };
+              return (
+                (severityOrder[b.severity] || 0) -
+                (severityOrder[a.severity] || 0)
+              );
+            });
+
+            // Save sorted analysis for Details view
+            lastAnalysis = { ...parsed, issues: sortedIssues };
+
             const tUi0 = performance.now();
             // Update score number
             const scoreEl = document.querySelector(".score-value");
@@ -365,12 +413,12 @@ document.addEventListener("DOMContentLoaded", function () {
               });
             }
 
-            // Replace Issues list (titles only in summary view)
+            // Replace Issues list (titles only in summary view, using sorted issues)
             const issuesList = document.querySelector(
               ".panel--danger .panel-list"
             );
             issuesList.innerHTML = "";
-            parsed.issues.forEach((issue) => {
+            sortedIssues.forEach((issue) => {
               const li = document.createElement("li");
               li.className = "danger";
               const title =
@@ -518,12 +566,12 @@ document.addEventListener("DOMContentLoaded", function () {
         Array.isArray(analysis.issues) ? analysis.issues.length : 0
       );
 
-    // Issues list
+    // Issues list (already sorted by heuristic weight in lastAnalysis)
     const list = container.querySelector("#issuesListDetailed");
     if (!list) return;
     list.innerHTML = "";
 
-    (analysis.issues || []).forEach((issue) => {
+    (analysis.issues || []).forEach((issue, index) => {
       const data =
         typeof issue === "string"
           ? {
@@ -534,8 +582,17 @@ document.addEventListener("DOMContentLoaded", function () {
               location: "",
               impact: "",
               recommendation: "",
+              heuristic_number: null,
             }
           : issue;
+
+      const heuristicInfo =
+        data.heuristic_number && HEURISTIC_NAMES[data.heuristic_number]
+          ? `<div class="kv" style="margin-top: 8px;">
+               <span class="k">Heuristic #${data.heuristic_number}:</span> 
+               <span class="v">${HEURISTIC_NAMES[data.heuristic_number]}</span>
+             </div>`
+          : "";
 
       const card = document.createElement("div");
       card.className = "issue-card";
@@ -552,14 +609,13 @@ document.addEventListener("DOMContentLoaded", function () {
             ? `<p class="issue-desc">${data.description}</p>`
             : ""
         }
+        ${heuristicInfo}
         ${
           data.location
-            ? `<div class="kv"><span class="k">Location:</span> <code class="v">${data.location}</code></div>`
-            : ""
-        }
-        ${
-          data.impact
-            ? `<div class="kv"><span class="k">Impact:</span> <span class="v">${data.impact}</span></div>`
+            ? `<div class="kv" style="background: #fef3c7; padding: 8px; border-radius: 6px; margin-top: 8px;">
+                 <span class="k" style="color: #92400e;">Location:</span> 
+                 <code class="v" style="background: #fef3c7; color: #92400e; font-weight: 600;">${data.location}</code>
+               </div>`
             : ""
         }
         ${
