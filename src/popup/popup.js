@@ -1,5 +1,6 @@
 let session;
 let lastAnalysis; // store the latest parsed analysis for Details view
+let previousIssues = []; // store previously reported issues to avoid repetition
 
 // Nielsen's 10 Heuristics weights (sum to 1.0)
 const HEURISTIC_WEIGHTS = {
@@ -96,6 +97,7 @@ async function reset() {
     session.destroy();
   }
   session = null;
+  previousIssues = []; // Clear previous issues when resetting session
 }
 
 // Wait for DOM to be fully loaded
@@ -150,29 +152,118 @@ document.addEventListener("DOMContentLoaded", function () {
           if (urlSubtitle) urlSubtitle.textContent = currentTab.url || "";
         } catch (_) {}
 
-        // Create concise structured summary for the model
+        // Create optimized structured summary (key details only for performance)
         const tCtx0 = performance.now();
+        const headingItems = pageInfo?.headings?.items || [];
+        const buttonItems = pageInfo?.buttons?.items || [];
+        const formItems = pageInfo?.forms?.items || [];
+
         const structuredSummary = JSON.stringify(
           {
             url: currentTab.url,
-            hierarchy: {
-              headings: pageInfo?.headings,
-              buttons: { count: pageInfo?.buttons?.count },
-              forms: pageInfo?.forms,
+
+            headings: {
+              count: pageInfo?.headings?.count || 0,
+              hasH1: pageInfo?.headings?.hasH1 || false,
+              emptyCount: headingItems.filter((h) => h?.isEmpty).length || 0,
+              structure: headingItems.slice(0, 5).map((h) => h?.level),
+              sampleTexts: headingItems
+                .slice(0, 3)
+                .map((h) => h?.text?.substring(0, 80) || ""),
             },
-            readability: {
-              wordCount: pageInfo?.textContent?.wordCount,
-              paragraphs: pageInfo?.textContent?.paragraphs,
-              averageSentenceLengthWords:
-                pageInfo?.readability?.averageSentenceLengthWords,
+
+            buttons: {
+              count: pageInfo?.buttons?.count || 0,
+              ariaLabelCount: buttonItems.filter((b) => b?.hasAriaLabel).length,
+              disabledCount: buttonItems.filter((b) => b?.isDisabled).length,
+              samples: buttonItems.slice(0, 5).map((b) => ({
+                text: b?.text?.substring(0, 30) || "",
+                hasAriaLabel: !!b?.hasAriaLabel,
+                isDisabled: !!b?.isDisabled,
+              })),
             },
+
+            forms: {
+              count: pageInfo?.forms?.count || 0,
+              withLabels: formItems.filter((f) => f?.hasLabels).length,
+              withRequiredFields: formItems.filter((f) => f?.hasRequiredFields)
+                .length,
+              averageInputFields:
+                formItems.length > 0
+                  ? Number(
+                      (
+                        formItems.reduce(
+                          (sum, form) => sum + (form?.inputCount || 0),
+                          0
+                        ) / formItems.length
+                      ).toFixed(1)
+                    )
+                  : 0,
+              samples: formItems.slice(0, 3),
+            },
+
+            images: {
+              total: pageInfo?.images?.total || 0,
+              missingAlt: pageInfo?.images?.missingAlt || 0,
+              emptyAlt: pageInfo?.images?.emptyAlt || 0,
+              withAlt: pageInfo?.images?.withAlt || 0,
+              exampleSelectors: (
+                pageInfo?.images?.missingAltSelectors || []
+              ).slice(0, 2),
+            },
+
+            links: {
+              total: pageInfo?.links?.total || 0,
+              emptyText: pageInfo?.links?.emptyText || 0,
+            },
+
+            touchTargets: {
+              total: pageInfo?.touchTargets?.total || 0,
+              smallCount: pageInfo?.touchTargets?.smallerThan44 || 0,
+              examples: (pageInfo?.touchTargets?.selectorsSmall || []).slice(
+                0,
+                2
+              ),
+            },
+
             accessibility: {
-              ariaElements: pageInfo?.ariaLabels?.total,
-              images: pageInfo?.images,
-              altQuality: pageInfo?.altTexts,
+              ariaElementCount: pageInfo?.ariaLabels?.total || 0,
+              hasAriaLabels: !!pageInfo?.ariaLabels?.hasAriaLabels,
+              altTextQuality: pageInfo?.altTexts || { good: 0, poor: 0 },
             },
-            contrast: pageInfo?.contrast,
-            touchTargets: pageInfo?.touchTargets,
+
+            textContent: {
+              wordCount: pageInfo?.textContent?.wordCount || 0,
+              characterCount: pageInfo?.textContent?.characterCount || 0,
+              paragraphs: pageInfo?.textContent?.paragraphs || 0,
+            },
+
+            readability: {
+              sentenceCount: pageInfo?.readability?.sentenceCount || 0,
+              averageSentenceLength: Number(
+                (
+                  pageInfo?.readability?.averageSentenceLengthWords || 0
+                ).toFixed(1)
+              ),
+              medianSentenceLength: Number(
+                (pageInfo?.readability?.medianSentenceLengthWords || 0).toFixed(
+                  1
+                )
+              ),
+            },
+
+            visual: {
+              uniqueColors: pageInfo?.colors?.uniqueColors || 0,
+              contrast: {
+                elementsChecked: pageInfo?.contrast?.elementsChecked || 0,
+                belowAA: pageInfo?.contrast?.belowAA || 0,
+                belowAAA: pageInfo?.contrast?.belowAAA || 0,
+                examples: (pageInfo?.contrast?.selectorsBelowAA || []).slice(
+                  0,
+                  2
+                ),
+              },
+            },
           },
           null,
           0
@@ -196,30 +287,59 @@ document.addEventListener("DOMContentLoaded", function () {
      .map(([k, w]) => `   ${k}. ${HEURISTIC_NAMES[k]} — weight ${w}`)
      .join("\n")}
 
-2. Score each heuristic from 0-100, then compute: usability_score = Σ(heuristic_score × weight)
+2. Score each heuristic from 0-100, then compute: usability_score = Σ(heuristic_score × weight).
+3. Do not confine scores to narrow bands (e.g., always within 70-80 or 80-90). Follow the evidence and weights to determine the final score. Only pages with many serious issues should fall below 60.
+
+**Scoring Calibration (IMPORTANT):**
+- Use the full 0-100 range. Avoid clustering most pages within a narrow band unless they genuinely share identical quality.
+- Treat 70 as a neutral, acceptable baseline when no major heuristics fail and there are clear strengths. Raise the score toward 85-95 for polished, well-structured experiences with only minor issues.
+- Reserve 50-69 for experiences with notable friction or multiple medium-severity problems. Drop below 50 only when severe usability failures exist across several heuristics.
+- When strong positives are detected (e.g., clear hierarchy, accessible buttons, high contrast, concise copy), reflect them by increasing the corresponding heuristic scores.
+
+**Heuristic Evaluation Workflow (MANDATORY):**
+1. For each heuristic (1-10), inspect the provided context and explicitly decide whether the evidence shows clear strengths, minor friction, or severe problems.
+2. Begin every heuristic at a baseline score of 70. Adjust upward when the context demonstrates clear strengths for that heuristic; adjust downward only when concrete issues are indicated. Severe failures should push the score below 50.
+3. Do **not** let one issue depress multiple heuristics unless the evidence clearly maps to each of them.
+4. After adjusting all ten heuristic scores, compute the overall usability_score strictly as Σ(heuristic_score × weight) using the weights given above. Double-check the arithmetic before returning the final JSON.
 
 **Issue Reporting Rules:**
 1. PRIORITY: Report issues related to HIGH-WEIGHT heuristics FIRST (especially #4, #1, #5, #3)
 2. Return 1-3 most critical issues, sorted by:
-   - First: Heuristic weight (higher weight = higher priority)
-   - Second: Severity (high > medium > low)
+   
+   -  Severity (high > medium > low)
 
 **Location Format (CRITICAL for developers):**
-- Be EXTREMELY SPECIFIC and ACTIONABLE
-- Include: CSS selector, element type, visual position, or XPath
-- Good examples:
-  * "Form input '#email' lacks label (line 42, main form)"
-  * "Button '.submit-btn' in header navigation"
-  * "<button class='cta'> in hero section, top-right"
-  * "All <img> tags without alt attributes in gallery grid"
-- Bad examples (too vague):
-  * "Navigation area"
-  * "Some buttons"
-  * "Footer section"
+- MUST provide SPECIFIC DOM element identifiers for every issue
+- REQUIRED: Give an exact CSS selector or ID that pinpoints the element (e.g. \`div.main > section.hero > button.cta-primary\`, \`form#signup-form input[name="email"]\`, \`header nav a.logo-link\`).
+- Include visual position when helpful (e.g., "top-right", "main content area")
+- Good examples (SPECIFIC DOM ELEMENTS):
+  * "input#email-field in <form class='signup-form'>"
+  * "button.submit-btn in header <nav>"
+  * "div.hero section.primary-callout button.cta-primary"
+  * "img.gallery-item:nth-of-type(3) in <div class='gallery-grid'>"
+  * "footer.site-footer ul.nav-links a[href='/pricing']"
+- Bad examples (TOO VAGUE - avoid these):
+  * "Navigation area" ❌
+  * "Some buttons" ❌
+  * "Footer section" ❌
+  * "Throughout the page" ❌
+
+**Issue Discovery Rules:**
+- Report REAL issues only - do NOT fabricate problems if the page is well-designed
+- If reanalyzing, find DIFFERENT issues than before (avoid repeating the same problems)
+- Return 1-3 issues maximum; if fewer genuine issues exist, return fewer
 
 Return ONLY valid JSON with the specified structure.`;
 
-        const prompt = `Context:\n${structuredSummary}`;
+        // Build context with previous issues if doing re-analysis
+        let contextPrompt = `Context:\n${structuredSummary}`;
+        if (previousIssues.length > 0) {
+          contextPrompt += `\n\nPreviously reported issues (DO NOT repeat these):\n${previousIssues
+            .map((issue, i) => `${i + 1}. ${issue.title}`)
+            .join("\n")}`;
+        }
+
+        const prompt = contextPrompt;
 
         // Define JSON schema separately and pass as responseConstraint
         const schema = {
@@ -233,7 +353,7 @@ Return ONLY valid JSON with the specified structure.`;
             },
             issues: {
               type: "array",
-              minItems: 1,
+              minItems: 0,
               maxItems: 3,
               items: {
                 type: "object",
@@ -272,15 +392,15 @@ Return ONLY valid JSON with the specified structure.`;
 
         try {
           const params = {
-            // control the stability of the model output
+            // Increased creativity for diverse analysis
             initialPrompts: [
               {
                 role: "system",
                 content: systemInstructions,
               },
             ],
-            temperature: 0.4,
-            topK: 3,
+            temperature: 0.6, // Balanced creativity and speed (was 0.4 → 0.8 → 0.6)
+            topK: 8, // Moderate exploration (was 3 → 20 → 8)
 
             expectedInputs: [{ type: "text", languages: ["en"] }],
             expectedOutputs: [{ type: "text", languages: ["en"] }],
@@ -388,6 +508,13 @@ Return ONLY valid JSON with the specified structure.`;
 
             // Save sorted analysis for Details view
             lastAnalysis = { ...parsed, issues: sortedIssues };
+
+            // Store current issues to avoid repetition in next analysis
+            previousIssues = [...previousIssues, ...sortedIssues];
+            // Keep only last 10 issues to prevent unlimited growth
+            if (previousIssues.length > 10) {
+              previousIssues = previousIssues.slice(-10);
+            }
 
             const tUi0 = performance.now();
             // Update score number
