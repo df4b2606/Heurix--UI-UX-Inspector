@@ -1,5 +1,6 @@
 let session;
 let lastAnalysis; // store the latest parsed analysis for Details view
+let lastAnalyzedTab = null;
 let previousIssues = []; // store previously reported issues to avoid repetition
 
 // Nielsen's 10 Heuristics weights (sum to 1.0)
@@ -107,11 +108,1281 @@ document.addEventListener("DOMContentLoaded", function () {
   const details = document.getElementById("details");
   const headerBackBtn = document.getElementById("headerBackBtn");
   const analyzeAgainBtnId = "analyzeAgainBtn";
+  const exportBtn = document.getElementById("exportBtn");
+
+  const ANALYZE_BTN_DEFAULT_HTML = analyzeBtn ? analyzeBtn.innerHTML : "";
+  const ANALYZE_BTN_LOADING_HTML = "<span>Analyzing...</span>";
+
+  const subtitleEl = document.querySelector(".subtitle");
+  const instructionEl = document.querySelector(".instruction-text");
+  const strengthsListEl = document.querySelector(".panel--success .panel-list");
+  const issuesListEl = document.querySelector(".panel--danger .panel-list");
+  const summaryTitleEl = document.querySelector(".panel--info .panel-title");
+  const summaryListEl = document.querySelector(".panel--info .panel-list");
+  const gaugeEl = document.querySelector(".gauge");
+  const scoreValueEl = gaugeEl ? gaugeEl.querySelector(".score-value") : null;
+  const viewDetailsBtn = document.getElementById("viewDetailsBtn");
+  const analyzeAgainBtn = document.getElementById(analyzeAgainBtnId);
+  const instructionDefaultText = instructionEl ? instructionEl.textContent : "";
+
+  let streamBuffer = "";
+  let streamApplied = {
+    usability_score: null,
+    strengths: null,
+    issues: null,
+    summary: null,
+  };
+  let skeletonDisplayed = false;
+
+  function resetStreamState() {
+    streamBuffer = "";
+    streamApplied = {
+      usability_score: null,
+      strengths: null,
+      issues: null,
+      summary: null,
+    };
+  }
+
+  function arraysEqual(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function decodeJsonString(raw) {
+    try {
+      return JSON.parse(`"${raw}"`);
+    } catch (_) {
+      return raw;
+    }
+  }
+
+  function extractIssueTitles(buffer) {
+    if (!buffer) return [];
+    const issuesIndex = buffer.indexOf('"issues"');
+    if (issuesIndex === -1) return [];
+    const substring = buffer.slice(issuesIndex);
+    const regex = /"title"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+    const titles = [];
+    let match;
+    while ((match = regex.exec(substring))) {
+      titles.push(decodeJsonString(match[1]));
+    }
+    return titles;
+  }
+
+  function getScoreColor(score) {
+    const numeric = Number(score);
+    if (Number.isFinite(numeric) && numeric >= 80) {
+      return {
+        primary: "#34A853",
+        track: "#e7f5eb",
+        glow: "rgba(52, 168, 83, 0.28)",
+        text: "#166534",
+      };
+    }
+    if (Number.isFinite(numeric) && numeric >= 60) {
+      return {
+        primary: "#FBBC05",
+        track: "#fff4d1",
+        glow: "rgba(251, 188, 5, 0.32)",
+        text: "#92400e",
+      };
+    }
+    if (Number.isFinite(numeric)) {
+      return {
+        primary: "#EA4335",
+        track: "#ffe4e1",
+        glow: "rgba(234, 67, 53, 0.32)",
+        text: "#b91c1c",
+      };
+    }
+    return {
+      primary: "#10b981",
+      track: "#ecfdf5",
+      glow: "rgba(16, 185, 129, 0.25)",
+      text: "#065f46",
+    };
+  }
+
+  function updateScoreDisplay(score, { animate = false } = {}) {
+    if (score == null) return;
+    const numeric = Number(score);
+    const rounded = Number.isFinite(numeric) ? Math.round(numeric) : 0;
+    if (scoreValueEl) {
+      if (animate) {
+        animateNumber(scoreValueEl, rounded);
+      } else {
+        scoreValueEl.textContent = String(rounded);
+      }
+      scoreValueEl.classList.remove("skeleton-text");
+      const { text } = getScoreColor(rounded);
+      scoreValueEl.style.color = text;
+    }
+    if (gaugeEl) {
+      const clamped = Math.max(0, Math.min(100, rounded));
+      const { primary, track, glow } = getScoreColor(rounded);
+      gaugeEl.style.background = `radial-gradient(closest-side, ${track} 72%, transparent 73% 100%), conic-gradient(${primary} ${clamped}%, #e5e7eb 0)`;
+      gaugeEl.style.boxShadow = `0 20px 60px ${glow}`;
+    }
+  }
+
+  function renderStrengths(strengths, { force = false } = {}) {
+    if (!strengthsListEl || !Array.isArray(strengths)) return;
+    if (!force && strengths.length === 0) return;
+    strengthsListEl.innerHTML = "";
+    if (strengths.length === 0) {
+      const li = document.createElement("li");
+      li.className = "success";
+      li.textContent = "暂未识别明显优势。";
+      strengthsListEl.appendChild(li);
+      return;
+    }
+    strengths.forEach((strength) => {
+      const li = document.createElement("li");
+      li.className = "success";
+      li.textContent = strength;
+      strengthsListEl.appendChild(li);
+    });
+  }
+
+  function renderIssues(issues, { force = false } = {}) {
+    if (!issuesListEl || !Array.isArray(issues)) return;
+    if (!force && issues.length === 0) return;
+    issuesListEl.innerHTML = "";
+    if (issues.length === 0) {
+      const li = document.createElement("li");
+      li.className = "danger";
+      li.textContent = "暂未检测到新的问题。";
+      issuesListEl.appendChild(li);
+      return;
+    }
+    issues.forEach((issue) => {
+      const li = document.createElement("li");
+      li.className = "danger";
+      const title =
+        typeof issue === "string"
+          ? issue
+          : issue?.title || issue?.description || "Issue";
+      li.textContent = title;
+      issuesListEl.appendChild(li);
+    });
+  }
+
+  function renderSummary(text, { force = false } = {}) {
+    if (!summaryListEl) return;
+    const safeText = typeof text === "string" ? text.trim() : "";
+    if (!force && !safeText) return;
+    summaryListEl.innerHTML = "";
+    const li = document.createElement("li");
+    li.className = "info";
+    li.textContent = safeText || "暂未生成摘要。";
+    summaryListEl.appendChild(li);
+  }
+
+  function applyStreamingState(nextState) {
+    const updated = { ...streamApplied };
+
+    if (
+      typeof nextState.usability_score === "number" &&
+      nextState.usability_score !== streamApplied.usability_score
+    ) {
+      updateScoreDisplay(nextState.usability_score, { animate: false });
+      updated.usability_score = nextState.usability_score;
+    }
+
+    if (
+      Array.isArray(nextState.strengths) &&
+      !arraysEqual(nextState.strengths, streamApplied.strengths || [])
+    ) {
+      renderStrengths(nextState.strengths);
+      updated.strengths = nextState.strengths;
+    }
+
+    if (
+      Array.isArray(nextState.issues) &&
+      !arraysEqual(nextState.issues, streamApplied.issues || [])
+    ) {
+      renderIssues(nextState.issues);
+      updated.issues = nextState.issues;
+    }
+
+    if (
+      typeof nextState.summary === "string" &&
+      nextState.summary &&
+      nextState.summary !== streamApplied.summary
+    ) {
+      renderSummary(nextState.summary);
+      updated.summary = nextState.summary;
+    }
+
+    streamApplied = { ...streamApplied, ...updated };
+  }
+
+  function handleStreamChunk(delta) {
+    if (!delta) return;
+    let piece = delta;
+    if (typeof piece !== "string") {
+      piece = String(piece);
+    }
+    if (!piece) return;
+    streamBuffer += piece;
+
+    const nextState = {};
+
+    const scoreMatch = streamBuffer.match(
+      /"usability_score"\s*:\s*([0-9]+(?:\.[0-9]+)?)/
+    );
+    if (scoreMatch) {
+      nextState.usability_score = Number(scoreMatch[1]);
+    }
+
+    const summaryMatch = streamBuffer.match(
+      /"summary"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/
+    );
+    if (summaryMatch) {
+      try {
+        nextState.summary = JSON.parse(`"${summaryMatch[1]}"`);
+      } catch (_) {}
+    }
+
+    const strengthsMatch = streamBuffer.match(
+      /"strengths"\s*:\s*(\[[\s\S]*?\])/
+    );
+    if (strengthsMatch) {
+      try {
+        nextState.strengths = JSON.parse(strengthsMatch[1]);
+      } catch (_) {}
+    }
+
+    const issuesMatch = streamBuffer.match(/"issues"\s*:\s*(\[[\s\S]*?\])/);
+    if (issuesMatch) {
+      try {
+        nextState.issues = JSON.parse(issuesMatch[1]);
+      } catch (_) {}
+    }
+
+    if (!Array.isArray(nextState.issues)) {
+      const titleOnlyIssues = extractIssueTitles(streamBuffer);
+      if (titleOnlyIssues.length > 0) {
+        nextState.issues = titleOnlyIssues.map((title) => ({ title }));
+      }
+    }
+
+    const hasRenderableData =
+      nextState.usability_score != null ||
+      (Array.isArray(nextState.issues) && nextState.issues.length > 0) ||
+      (Array.isArray(nextState.strengths) && nextState.strengths.length > 0) ||
+      (typeof nextState.summary === "string" && nextState.summary);
+
+    if (!skeletonDisplayed && hasRenderableData) {
+      prepareResultsSkeleton({ reset: false });
+    }
+
+    applyStreamingState(nextState);
+  }
+
+  function finalizeAnalysis(parsed, sortedIssues) {
+    if (!skeletonDisplayed) {
+      prepareResultsSkeleton({ reset: false });
+    }
+    if (parsed && typeof parsed.usability_score === "number") {
+      const alreadyHadScore = streamApplied.usability_score != null;
+      updateScoreDisplay(parsed.usability_score, {
+        animate: !alreadyHadScore,
+      });
+      streamApplied.usability_score = parsed.usability_score;
+    }
+
+    const strengthsArray = Array.isArray(parsed?.strengths)
+      ? parsed.strengths
+      : [];
+    renderStrengths(strengthsArray, { force: true });
+    streamApplied.strengths = strengthsArray;
+
+    const finalIssues = Array.isArray(sortedIssues) ? sortedIssues : [];
+    renderIssues(finalIssues, { force: true });
+    streamApplied.issues = finalIssues;
+
+    const summaryText =
+      typeof parsed?.summary === "string" ? parsed.summary : "";
+    renderSummary(summaryText, { force: true });
+    streamApplied.summary = summaryText;
+
+    if (results) {
+      results.classList.remove("streaming");
+      results.removeAttribute("aria-busy");
+    }
+    if (scoreValueEl) {
+      scoreValueEl.classList.remove("skeleton-text");
+    }
+    if (viewDetailsBtn) viewDetailsBtn.removeAttribute("disabled");
+    if (analyzeAgainBtn) analyzeAgainBtn.removeAttribute("disabled");
+    setExportButtonEnabled(true);
+  }
+
+  function setAnalyzeButtonLoading(isLoading) {
+    if (!analyzeBtn) return;
+    if (isLoading) {
+      analyzeBtn.classList.add("loading");
+      analyzeBtn.innerHTML = ANALYZE_BTN_LOADING_HTML;
+      analyzeBtn.setAttribute("disabled", "disabled");
+    } else {
+      analyzeBtn.classList.remove("loading");
+      analyzeBtn.innerHTML = ANALYZE_BTN_DEFAULT_HTML;
+      analyzeBtn.removeAttribute("disabled");
+    }
+  }
+
+  function setExportButtonEnabled(enabled) {
+    if (!exportBtn) return;
+    if (enabled) {
+      exportBtn.removeAttribute("disabled");
+    } else {
+      exportBtn.setAttribute("disabled", "disabled");
+    }
+  }
+
+  function setSkeletonList(listElement, count, baseClass) {
+    if (!listElement) return;
+    listElement.innerHTML = "";
+    for (let i = 0; i < count; i += 1) {
+      const li = document.createElement("li");
+      li.className = baseClass ? `${baseClass} skeleton-text` : "skeleton-text";
+      li.textContent = "生成中…";
+      listElement.appendChild(li);
+    }
+  }
+
+  function enterAnalysisPendingState() {
+    skeletonDisplayed = false;
+    resetStreamState();
+    lastAnalysis = null;
+    if (results) {
+      results.classList.add("hidden");
+      results.classList.remove("streaming");
+      results.removeAttribute("aria-busy");
+    }
+    if (details) details.classList.add("hidden");
+    if (headerBackBtn) headerBackBtn.style.display = "none";
+    if (subtitleEl) subtitleEl.style.display = "";
+    if (instructionEl) {
+      instructionEl.style.display = "none";
+      instructionEl.textContent = instructionDefaultText;
+    }
+    if (analyzeBtn) {
+      analyzeBtn.style.display = "";
+    }
+    if (viewDetailsBtn) viewDetailsBtn.setAttribute("disabled", "disabled");
+    if (analyzeAgainBtn) analyzeAgainBtn.setAttribute("disabled", "disabled");
+    setExportButtonEnabled(false);
+  }
+
+  function prepareResultsSkeleton({ reset = true } = {}) {
+    if (reset) {
+      resetStreamState();
+    }
+    skeletonDisplayed = true;
+    if (subtitleEl) subtitleEl.style.display = "none";
+    if (instructionEl) {
+      instructionEl.style.display = "none";
+      instructionEl.textContent = instructionDefaultText;
+    }
+    if (analyzeBtn) {
+      analyzeBtn.style.display = "none";
+    }
+    if (results) {
+      results.classList.remove("hidden");
+      results.classList.add("streaming");
+      results.setAttribute("aria-busy", "true");
+    }
+    if (scoreValueEl) {
+      scoreValueEl.textContent = "…";
+      scoreValueEl.classList.add("skeleton-text");
+      scoreValueEl.style.color = "";
+    }
+    if (gaugeEl) {
+      gaugeEl.style.background =
+        "radial-gradient(closest-side, #f3f4f6 72%, transparent 73% 100%), conic-gradient(#e5e7eb 0%, #e5e7eb 0)";
+      gaugeEl.style.boxShadow = "0 20px 60px rgba(107, 114, 128, 0.16)";
+    }
+    setSkeletonList(strengthsListEl, 3, "success");
+    setSkeletonList(issuesListEl, 3, "danger");
+    if (summaryTitleEl) summaryTitleEl.textContent = "Summary";
+    setSkeletonList(summaryListEl, 1, "info");
+    if (viewDetailsBtn) viewDetailsBtn.setAttribute("disabled", "disabled");
+    if (analyzeAgainBtn) analyzeAgainBtn.setAttribute("disabled", "disabled");
+    setExportButtonEnabled(false);
+  }
+
+  function clearResultsSkeleton() {
+    if (results) {
+      results.classList.remove("streaming");
+      results.removeAttribute("aria-busy");
+    }
+    if (scoreValueEl) {
+      scoreValueEl.classList.remove("skeleton-text");
+      if (!scoreValueEl.textContent || scoreValueEl.textContent === "…") {
+        scoreValueEl.textContent = "0";
+      }
+      scoreValueEl.style.color = "";
+    }
+    if (strengthsListEl) strengthsListEl.innerHTML = "";
+    if (issuesListEl) issuesListEl.innerHTML = "";
+    if (summaryListEl) summaryListEl.innerHTML = "";
+    if (gaugeEl) {
+      gaugeEl.style.background = "";
+      gaugeEl.style.boxShadow = "";
+    }
+    setExportButtonEnabled(false);
+  }
+
+  function showIntroView() {
+    resetStreamState();
+    clearResultsSkeleton();
+    if (results) results.classList.add("hidden");
+    if (details) details.classList.add("hidden");
+    if (subtitleEl) subtitleEl.style.display = "";
+    if (instructionEl) {
+      instructionEl.style.display = "";
+      instructionEl.textContent = instructionDefaultText;
+    }
+    if (headerBackBtn) headerBackBtn.style.display = "none";
+    skeletonDisplayed = false;
+    if (analyzeBtn) {
+      analyzeBtn.style.display = "";
+      setAnalyzeButtonLoading(false);
+    }
+  }
+
+  function animateNumber(element, target, duration = 600) {
+    return new Promise((resolve) => {
+      if (!element) {
+        resolve();
+        return;
+      }
+      const startValue = Number(element.textContent) || 0;
+      const startTime = performance.now();
+      const normalizedTarget = Number(target) || 0;
+
+      function step(now) {
+        const progress = Math.min(1, (now - startTime) / duration);
+        const value = Math.round(
+          startValue + (normalizedTarget - startValue) * progress
+        );
+        element.textContent = String(value);
+        if (progress < 1) {
+          requestAnimationFrame(step);
+        } else {
+          resolve();
+        }
+      }
+
+      requestAnimationFrame(step);
+    });
+  }
+
+  if (analyzeAgainBtn) {
+    analyzeAgainBtn.addEventListener("click", () => {
+      showIntroView();
+      runAnalysis();
+    });
+  }
+
+  if (viewDetailsBtn) {
+    viewDetailsBtn.addEventListener("click", () => {
+      if (!lastAnalysis) return;
+
+      renderDetails(lastAnalysis, lastAnalyzedTab);
+
+      if (results) results.classList.add("hidden");
+      if (details) details.classList.remove("hidden");
+      if (headerBackBtn) headerBackBtn.style.display = "inline-flex";
+    });
+  }
+
+  if (headerBackBtn) {
+    headerBackBtn.addEventListener("click", () => {
+      if (details) details.classList.add("hidden");
+      if (results) results.classList.remove("hidden");
+      headerBackBtn.style.display = "none";
+    });
+  }
+
+  if (exportBtn) {
+    exportBtn.addEventListener("click", handleExportClick);
+  }
+
+  async function handleExportClick() {
+    if (!lastAnalysis) {
+      alert("⚠️ 请先运行分析以生成报告。");
+      return;
+    }
+
+    try {
+      const lines = buildReportLines(lastAnalysis, lastAnalyzedTab);
+      const logoImage = await getReportLogoImage();
+      const rawScore = Number(lastAnalysis.usability_score);
+      const normalizedScore = Number.isFinite(rawScore)
+        ? Math.max(0, Math.min(100, rawScore))
+        : 0;
+      const scoreRingImage = createScoreRingImage(normalizedScore);
+      const pdfBytes = createPdfReport({
+        lines,
+        logoImage,
+        scoreRingImage,
+      });
+      const blob = new Blob([pdfBytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const fileName = buildReportFileName(lastAnalyzedTab);
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (error) {
+      console.error("Failed to export report:", error);
+      alert("❌ 报告导出失败，请重试。");
+    }
+  }
+
+  function buildReportFileName(tabInfo) {
+    const base = sanitizeFileName(
+      tabInfo?.title || tabInfo?.url || "ux-report"
+    );
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:T]/g, "-")
+      .split(".")[0];
+    return `${base || "ux-report"}-${timestamp}.pdf`;
+  }
+
+  const MAX_LINE_LENGTH = 90;
+
+  function buildReportLines(analysis, tabInfo) {
+    const lines = [];
+    const now = new Date();
+
+    pushWrapped(lines, "Heurix - UX Audit Report");
+    pushWrapped(lines, `Generated: ${now.toLocaleString()}`);
+    if (tabInfo?.title) {
+      pushWrapped(lines, `Page Title: ${tabInfo.title}`);
+    }
+    if (tabInfo?.url) {
+      pushWrapped(lines, `URL: ${tabInfo.url}`);
+    }
+
+    lines.push("");
+    pushWrapped(
+      lines,
+      `Usability Score: ${Math.round(analysis.usability_score || 0)} / 100`
+    );
+
+    if (analysis.summary) {
+      lines.push("");
+      pushWrapped(lines, "Summary:");
+      pushWrapped(lines, analysis.summary, 2);
+    }
+
+    if (Array.isArray(analysis.strengths) && analysis.strengths.length > 0) {
+      lines.push("");
+      pushWrapped(lines, "Strengths:");
+      analysis.strengths.forEach((strength, index) => {
+        pushWrapped(lines, `${index + 1}. ${strength}`, 2);
+      });
+    }
+
+    if (Array.isArray(analysis.issues) && analysis.issues.length > 0) {
+      lines.push("");
+      pushWrapped(lines, "Key Issues:");
+      analysis.issues.forEach((issue, index) => {
+        const titleLine = `${index + 1}. ${issue.title || "Issue"} [${(
+          issue.severity || ""
+        ).toUpperCase()}]`;
+        pushWrapped(lines, titleLine.replace(/\s+/g, " "), 2);
+        if (issue.description) {
+          pushWrapped(lines, `Description: ${issue.description}`, 4);
+        }
+        if (issue.location) {
+          pushWrapped(lines, `Location: ${issue.location}`, 4);
+        }
+        if (issue.impact) {
+          pushWrapped(lines, `Impact: ${issue.impact}`, 4);
+        }
+        if (issue.recommendation) {
+          pushWrapped(lines, `Recommendation: ${issue.recommendation}`, 4);
+        }
+        lines.push("");
+      });
+      while (lines.length && lines[lines.length - 1] === "") {
+        lines.pop();
+      }
+    }
+
+    return lines;
+  }
+
+  function pushWrapped(target, text, indentSpaces = 0) {
+    if (text == null) return;
+    const indent = " ".repeat(indentSpaces);
+    const available = Math.max(10, MAX_LINE_LENGTH - indentSpaces);
+    const wrapped = wrapText(String(text), available);
+    if (wrapped.length === 0) {
+      target.push(indent.trimEnd());
+      return;
+    }
+    wrapped.forEach((segment) => {
+      target.push((indent + segment).trimEnd());
+    });
+  }
+
+  function wrapText(text, maxLen) {
+    const clean = text.replace(/\s+/g, " ").trim();
+    if (!clean) return [];
+    const words = clean.split(" ");
+    const lines = [];
+    let current = "";
+
+    words.forEach((word) => {
+      const safeWord = word || "";
+      if (safeWord.length > maxLen) {
+        if (current) {
+          lines.push(current);
+          current = "";
+        }
+        for (let i = 0; i < safeWord.length; i += maxLen) {
+          lines.push(safeWord.slice(i, i + maxLen));
+        }
+        return;
+      }
+
+      if (!current) {
+        current = safeWord;
+        return;
+      }
+
+      if (`${current} ${safeWord}`.length <= maxLen) {
+        current = `${current} ${safeWord}`;
+      } else {
+        lines.push(current);
+        current = safeWord;
+      }
+    });
+
+    if (current) {
+      lines.push(current);
+    }
+
+    return lines;
+  }
+
+  function sanitizeFileName(input) {
+    return String(input || "")
+      .replace(/[\\/:*?"<>|]/g, "-")
+      .replace(/\s+/g, "-")
+      .slice(0, 80);
+  }
+
+  function escapePdfText(text) {
+    return text
+      .replace(/[\u0000-\u001F\u007F-\uFFFF]/g, "?")
+      .replace(/\\/g, "\\\\")
+      .replace(/\(/g, "\\(")
+      .replace(/\)/g, "\\)");
+  }
+
+  let cachedReportLogoImage = null;
+
+  async function getReportLogoImage() {
+    if (cachedReportLogoImage !== null) {
+      return cachedReportLogoImage;
+    }
+
+    try {
+      const url = chrome.runtime.getURL("images/icon-128.png");
+      const image = await loadImageAsJpegUint8Array(url, {
+        maxDimension: 256,
+        quality: 0.92,
+      });
+
+      if (!image?.data?.length) {
+        cachedReportLogoImage = null;
+        return cachedReportLogoImage;
+      }
+
+      const displayWidth = 110;
+      const aspectRatio = image.height > 0 ? image.height / image.width : 1;
+      const displayHeight = Math.max(1, Math.round(displayWidth * aspectRatio));
+
+      cachedReportLogoImage = {
+        ...image,
+        displayWidth,
+        displayHeight,
+        resourceName: "/Im1",
+      };
+    } catch (error) {
+      console.warn("Failed to load logo for PDF:", error);
+      cachedReportLogoImage = null;
+    }
+
+    return cachedReportLogoImage;
+  }
+
+  async function loadImageAsJpegUint8Array(url, options = {}) {
+    const { maxDimension = 256, quality = 0.92 } = options;
+
+    const image = await new Promise((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () =>
+        reject(new Error(`Failed to load image for PDF: ${url}`));
+      element.crossOrigin = "anonymous";
+      element.src = url;
+    });
+
+    const naturalWidth = image.naturalWidth || image.width;
+    const naturalHeight = image.naturalHeight || image.height;
+    const maxSide = Math.max(naturalWidth, naturalHeight);
+    const scale = maxSide > maxDimension ? maxDimension / maxSide : 1;
+    const canvasWidth = Math.max(1, Math.round(naturalWidth * scale));
+    const canvasHeight = Math.max(1, Math.round(naturalHeight * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+
+    ctx.drawImage(image, 0, 0, canvasWidth, canvasHeight);
+    const dataUrl = canvas.toDataURL("image/jpeg", quality);
+
+    return {
+      data: dataUrlToUint8Array(dataUrl),
+      width: canvasWidth,
+      height: canvasHeight,
+    };
+  }
+
+  function createScoreRingImage(score) {
+    const normalized = Math.max(0, Math.min(100, Number(score) || 0));
+    const palette = getScoreColor(normalized) || {};
+    const trackColor = palette.track || "#e5e7eb";
+    const ringColor = palette.primary || "#2563eb";
+    const textColor = palette.text || "#0f172a";
+
+    const size = 260;
+    const ringWidth = 28;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+
+    const center = size / 2;
+    const radius = center - ringWidth;
+
+    ctx.clearRect(0, 0, size, size);
+
+    const backgroundGradient = ctx.createRadialGradient(
+      center,
+      center,
+      radius * 0.15,
+      center,
+      center,
+      radius * 1.1
+    );
+    backgroundGradient.addColorStop(0, "#ffffff");
+    backgroundGradient.addColorStop(1, "#f8fafc");
+    ctx.fillStyle = backgroundGradient;
+    ctx.fillRect(0, 0, size, size);
+
+    ctx.lineWidth = ringWidth;
+    ctx.lineCap = "round";
+
+    ctx.strokeStyle = trackColor;
+    ctx.beginPath();
+    ctx.arc(center, center, radius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = ringColor;
+    ctx.beginPath();
+    ctx.arc(
+      center,
+      center,
+      radius,
+      -Math.PI / 2,
+      -Math.PI / 2 + (Math.PI * 2 * normalized) / 100
+    );
+    ctx.stroke();
+
+    ctx.fillStyle = textColor;
+    ctx.font = "bold 68px 'Arial'";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(Math.round(normalized)), center, center - 6);
+
+    ctx.fillStyle = "#4b5563";
+    ctx.font = "24px 'Arial'";
+    ctx.fillText("/100", center, center + 38);
+
+    ctx.fillStyle = "#4b5563";
+    ctx.font = "22px 'Arial'";
+    ctx.fillText("Usability Score", center, center + radius - 30);
+
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+
+    return {
+      data: dataUrlToUint8Array(dataUrl),
+      width: canvas.width,
+      height: canvas.height,
+      displayWidth: 160,
+      displayHeight: 160,
+      resourceName: "/Im2",
+    };
+  }
+
+  function dataUrlToUint8Array(dataUrl) {
+    const [, base64 = ""] = String(dataUrl || "").split(",");
+    const binary = atob(base64);
+    const length = binary.length;
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function concatUint8Arrays(arrays) {
+    const total = arrays.reduce((sum, arr) => sum + (arr?.length || 0), 0);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    arrays.forEach((arr) => {
+      if (!arr) return;
+      result.set(arr, offset);
+      offset += arr.length;
+    });
+    return result;
+  }
+
+  function formatPdfNumber(value) {
+    if (!Number.isFinite(value)) return "0";
+    return (Math.round(value * 100) / 100).toString();
+  }
+
+  let textMeasureContext = null;
+
+  function getTextMeasureContext() {
+    if (textMeasureContext) {
+      return textMeasureContext;
+    }
+    const canvas = document.createElement("canvas");
+    textMeasureContext = canvas.getContext("2d");
+    return textMeasureContext;
+  }
+
+  function measureTextWidth(
+    text,
+    { fontSize = 12, fontWeight = "", fontFamily = "Helvetica" } = {}
+  ) {
+    const ctx = getTextMeasureContext();
+    if (!ctx) {
+      return String(text || "").length * (fontSize * 0.5);
+    }
+    const parts = [fontWeight, `${fontSize}px`, fontFamily].filter(Boolean);
+    ctx.save();
+    ctx.font = parts.join(" ");
+    const metrics = ctx.measureText(String(text || ""));
+    ctx.restore();
+    return metrics.width || 0;
+  }
+
+  function cssPxToPdfPoints(px) {
+    return (Number(px) || 0) * 0.75;
+  }
+
+  function createPdfReport({ lines, logoImage, scoreRingImage }) {
+    const encoder = new TextEncoder();
+    const pageWidth = 595;
+    const pageHeight = 842;
+    const marginX = 60;
+    const headerHeight = Math.round(pageHeight / 6);
+    const headerY = pageHeight - headerHeight;
+    const lineHeight = 16;
+    const MIN_BOTTOM_MARGIN = 80;
+
+    const sanitizedLines = lines.map((line) => escapePdfText(line || ""));
+    const titleLine = sanitizedLines[0] || "";
+    const bodyLines = sanitizedLines.slice(1);
+
+    const logoPlacement =
+      logoImage && logoImage.data?.length
+        ? (() => {
+            const baseWidth = logoImage.displayWidth || logoImage.width || 120;
+            const displayWidth = Math.min(160, baseWidth);
+            const ratio = logoImage.width
+              ? logoImage.height / Math.max(logoImage.width, 1)
+              : 1;
+            const computedHeight =
+              logoImage.displayHeight || Math.round(displayWidth * ratio);
+            const displayHeight = Math.min(
+              headerHeight - 24,
+              Math.max(60, computedHeight || 120)
+            );
+            return {
+              ...logoImage,
+              displayWidth,
+              displayHeight,
+              x: (pageWidth - displayWidth) / 2,
+              y: headerY + (headerHeight - displayHeight) / 2,
+              resourceName: logoImage.resourceName || "/Im1",
+            };
+          })()
+        : null;
+
+    const titleFontSize = 20;
+    const titleWidthPx = measureTextWidth(titleLine, {
+      fontSize: titleFontSize,
+      fontWeight: "bold",
+    });
+    const titleWidthPoints = cssPxToPdfPoints(titleWidthPx);
+    const titleX = titleLine ? (pageWidth - titleWidthPoints) / 2 : marginX;
+    const titleY = headerY - 34;
+
+    const ringPlacement =
+      scoreRingImage && scoreRingImage.data?.length
+        ? (() => {
+            const displayWidth = scoreRingImage.displayWidth || 160;
+            const displayHeight = scoreRingImage.displayHeight || displayWidth;
+            return {
+              ...scoreRingImage,
+              displayWidth,
+              displayHeight,
+              x: (pageWidth - displayWidth) / 2,
+              y: titleY - 36 - displayHeight,
+              resourceName: scoreRingImage.resourceName || "/Im2",
+            };
+          })()
+        : null;
+
+    const bodyBaseY = ringPlacement ? ringPlacement.y - 70 : titleY - 90;
+    const maxLinesFirstPage =
+      bodyBaseY > MIN_BOTTOM_MARGIN
+        ? Math.max(
+            0,
+            Math.floor((bodyBaseY - MIN_BOTTOM_MARGIN) / lineHeight) + 1
+          )
+        : 0;
+
+    const firstPageBodyLines =
+      maxLinesFirstPage > 0 ? bodyLines.slice(0, maxLinesFirstPage) : [];
+    const remainingBodyLines =
+      maxLinesFirstPage > 0
+        ? bodyLines.slice(firstPageBodyLines.length)
+        : bodyLines.slice();
+
+    let textStartY = bodyBaseY;
+    if (firstPageBodyLines.length > 0) {
+      const usedLineCount = Math.max(0, firstPageBodyLines.length - 1);
+      const bottomY = textStartY - lineHeight * usedLineCount;
+      if (bottomY < MIN_BOTTOM_MARGIN) {
+        textStartY += MIN_BOTTOM_MARGIN - bottomY;
+      }
+      textStartY = Math.min(textStartY, bodyBaseY);
+      textStartY = Math.max(textStartY, MIN_BOTTOM_MARGIN + lineHeight);
+    }
+
+    const headerColor = {
+      r: 124 / 255,
+      g: 58 / 255,
+      b: 237 / 255,
+    };
+
+    const firstPageCommands = [];
+    firstPageCommands.push("q");
+    firstPageCommands.push(
+      `${formatPdfNumber(headerColor.r)} ${formatPdfNumber(
+        headerColor.g
+      )} ${formatPdfNumber(headerColor.b)} rg`
+    );
+    firstPageCommands.push(
+      `0 ${formatPdfNumber(headerY)} ${formatPdfNumber(
+        pageWidth
+      )} ${formatPdfNumber(headerHeight)} re`
+    );
+    firstPageCommands.push("f");
+    firstPageCommands.push("Q");
+
+    const images = [];
+    const firstPageXObjectNames = [];
+
+    if (logoPlacement) {
+      images.push({ ...logoPlacement });
+      firstPageXObjectNames.push(logoPlacement.resourceName || "/Im1");
+      firstPageCommands.push("q");
+      firstPageCommands.push(
+        `${formatPdfNumber(logoPlacement.displayWidth)} 0 0 ${formatPdfNumber(
+          logoPlacement.displayHeight
+        )} ${formatPdfNumber(logoPlacement.x)} ${formatPdfNumber(
+          logoPlacement.y
+        )} cm`
+      );
+      firstPageCommands.push(`${logoPlacement.resourceName || "/Im1"} Do`);
+      firstPageCommands.push("Q");
+    }
+
+    if (titleLine) {
+      firstPageCommands.push("BT");
+      firstPageCommands.push(`/F1 ${formatPdfNumber(titleFontSize)} Tf`);
+      firstPageCommands.push("20 TL");
+      firstPageCommands.push(
+        `1 0 0 1 ${formatPdfNumber(titleX)} ${formatPdfNumber(titleY)} Tm`
+      );
+      firstPageCommands.push(`(${titleLine}) Tj`);
+      firstPageCommands.push("ET");
+    }
+
+    if (ringPlacement) {
+      images.push({ ...ringPlacement });
+      firstPageXObjectNames.push(ringPlacement.resourceName || "/Im2");
+      firstPageCommands.push("q");
+      firstPageCommands.push(
+        `${formatPdfNumber(ringPlacement.displayWidth)} 0 0 ${formatPdfNumber(
+          ringPlacement.displayHeight
+        )} ${formatPdfNumber(ringPlacement.x)} ${formatPdfNumber(
+          ringPlacement.y
+        )} cm`
+      );
+      firstPageCommands.push(`${ringPlacement.resourceName || "/Im2"} Do`);
+      firstPageCommands.push("Q");
+    }
+
+    if (firstPageBodyLines.length > 0) {
+      const firstBodyLine = firstPageBodyLines[0] || "";
+      firstPageCommands.push("BT");
+      firstPageCommands.push("/F1 12 Tf");
+      firstPageCommands.push("16 TL");
+      firstPageCommands.push(
+        `1 0 0 1 ${formatPdfNumber(marginX)} ${formatPdfNumber(textStartY)} Tm`
+      );
+      firstPageCommands.push(firstBodyLine ? `(${firstBodyLine}) Tj` : "() Tj");
+      if (firstPageBodyLines.length > 1) {
+        firstPageBodyLines.slice(1).forEach((line) => {
+          firstPageCommands.push("T*");
+          if (line) {
+            firstPageCommands.push(`(${line}) Tj`);
+          }
+        });
+      }
+      firstPageCommands.push("ET");
+    }
+
+    const pageDescriptors = [
+      {
+        commands: firstPageCommands,
+        xObjectNames: firstPageXObjectNames,
+      },
+    ];
+
+    if (remainingBodyLines.length > 0) {
+      const additionalStartY = pageHeight - 80;
+      const maxLinesPerAdditionalPage = Math.max(
+        1,
+        Math.floor((additionalStartY - MIN_BOTTOM_MARGIN) / lineHeight) + 1
+      );
+
+      for (
+        let index = 0;
+        index < remainingBodyLines.length;
+        index += maxLinesPerAdditionalPage
+      ) {
+        const pageLines = remainingBodyLines.slice(
+          index,
+          index + maxLinesPerAdditionalPage
+        );
+        const commands = [];
+        commands.push("BT");
+        commands.push("/F1 12 Tf");
+        commands.push("16 TL");
+        commands.push(
+          `1 0 0 1 ${formatPdfNumber(marginX)} ${formatPdfNumber(
+            additionalStartY
+          )} Tm`
+        );
+        if (pageLines.length > 0) {
+          commands.push(pageLines[0] ? `(${pageLines[0]}) Tj` : "() Tj");
+          pageLines.slice(1).forEach((line) => {
+            commands.push("T*");
+            if (line) {
+              commands.push(`(${line}) Tj`);
+            }
+          });
+        } else {
+          commands.push("() Tj");
+        }
+        commands.push("ET");
+
+        pageDescriptors.push({ commands, xObjectNames: [] });
+      }
+    }
+
+    const encodedPages = pageDescriptors.map((descriptor) => ({
+      ...descriptor,
+      stream: `${descriptor.commands.join("\n")}\n`,
+    }));
+
+    encodedPages.forEach((page) => {
+      page.contentBytes = encoder.encode(page.stream);
+    });
+
+    const catalogId = 1;
+    const pagesId = 2;
+    let nextObjectId = 3;
+
+    const pageObjects = encodedPages.map((page) => {
+      const pageId = nextObjectId;
+      const contentId = nextObjectId + 1;
+      nextObjectId += 2;
+      return {
+        ...page,
+        pageId,
+        contentId,
+      };
+    });
+
+    const fontObjectId = nextObjectId;
+    nextObjectId += 1;
+
+    const imageLookup = {};
+    images.forEach((image) => {
+      image.objectId = nextObjectId;
+      imageLookup[image.resourceName || "/Im"] = image;
+      nextObjectId += 1;
+    });
+
+    const objects = [];
+
+    const catalogObject = encoder.encode(
+      `${catalogId} 0 obj\n<< /Type /Catalog /Pages ${pagesId} 0 R >>\nendobj\n`
+    );
+    objects.push(catalogObject);
+
+    const kidsEntries = pageObjects
+      .map((page) => `${page.pageId} 0 R`)
+      .join(" ");
+    const pagesObject = encoder.encode(
+      `${pagesId} 0 obj\n<< /Type /Pages /Kids [${kidsEntries}] /Count ${pageObjects.length} >>\nendobj\n`
+    );
+    objects.push(pagesObject);
+
+    pageObjects.forEach((page) => {
+      const resourceSegments = [`/Font << /F1 ${fontObjectId} 0 R >>`];
+      const xObjectEntries = page.xObjectNames
+        .map((name) => {
+          const image = imageLookup[name];
+          if (!image) return "";
+          return `${name} ${image.objectId} 0 R`;
+        })
+        .filter(Boolean)
+        .join(" ");
+      if (xObjectEntries) {
+        resourceSegments.push(`/XObject << ${xObjectEntries} >>`);
+      }
+
+      const pageObject = encoder.encode(
+        `${
+          page.pageId
+        } 0 obj\n<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Contents ${
+          page.contentId
+        } 0 R /Resources << ${resourceSegments.join(" ")} >> >>\nendobj\n`
+      );
+      objects.push(pageObject);
+
+      const contentObject = concatUint8Arrays([
+        encoder.encode(
+          `${page.contentId} 0 obj\n<< /Length ${page.contentBytes.length} >>\nstream\n`
+        ),
+        page.contentBytes,
+        encoder.encode(`endstream\nendobj\n`),
+      ]);
+      objects.push(contentObject);
+    });
+
+    const fontObject = encoder.encode(
+      `${fontObjectId} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n`
+    );
+    objects.push(fontObject);
+
+    images.forEach((image) => {
+      const imageObject = concatUint8Arrays([
+        encoder.encode(
+          `${
+            image.objectId
+          } 0 obj\n<< /Type /XObject /Subtype /Image /Width ${Math.max(
+            1,
+            Math.round(image.width)
+          )} /Height ${Math.max(
+            1,
+            Math.round(image.height)
+          )} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${
+            image.data.length
+          } >>\nstream\n`
+        ),
+        image.data,
+        encoder.encode(`\nendstream\nendobj\n`),
+      ]);
+      objects.push(imageObject);
+    });
+
+    const header = encoder.encode("%PDF-1.4\n");
+    const segments = [header, ...objects];
+
+    const offsets = [0];
+    let position = header.length;
+    objects.forEach((obj) => {
+      offsets.push(position);
+      position += obj.length;
+    });
+
+    const xrefOffset = position;
+    const xrefLines = [
+      "xref",
+      `0 ${objects.length + 1}`,
+      "0000000000 65535 f ",
+    ];
+    for (let i = 1; i <= objects.length; i += 1) {
+      const offset = offsets[i];
+      xrefLines.push(`${String(offset).padStart(10, "0")} 00000 n `);
+    }
+
+    const xrefSection = encoder.encode(`${xrefLines.join("\n")}\n`);
+    const trailerSection = encoder.encode(
+      `trailer\n<< /Size ${
+        objects.length + 1
+      } /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+    );
+
+    segments.push(xrefSection);
+    segments.push(trailerSection);
+
+    return concatUint8Arrays(segments);
+  }
 
   async function runAnalysis() {
-    // Add loading state
-    analyzeBtn.classList.add("loading");
-    analyzeBtn.innerHTML = "<span>Analyzing...</span>";
+    setAnalyzeButtonLoading(true);
+    enterAnalysisPendingState();
     const tTotal0 = performance.now();
 
     // Query the active tab
@@ -119,6 +1390,10 @@ document.addEventListener("DOMContentLoaded", function () {
       { active: true, currentWindow: true },
       async function (tabs) {
         const currentTab = tabs[0];
+        lastAnalyzedTab = {
+          title: currentTab?.title || "",
+          url: currentTab?.url || "",
+        };
 
         // Ask content script for structured page info
         const tMsg0 = performance.now();
@@ -278,7 +1553,7 @@ document.addEventListener("DOMContentLoaded", function () {
           `[Heurix][Perf] build structured context: size: ${structuredSummary.length} chars`
         );
 
-        const systemInstructions = `You are a UX/UI expert evaluating web pages based on Nielsen's 10 Usability Heuristics.
+        const systemInstructions = `You are a UX/UI expert evaluating web pages based on Nielsen's 10 Usability Heuristics. Your goal is to help the developers improve the UI design and usability of the page.
 
 **Scoring Rules (CRITICAL):**
 1. Calculate the overall usability_score using STRICTLY these weighted heuristics (weights sum to 1.0):
@@ -303,10 +1578,10 @@ document.addEventListener("DOMContentLoaded", function () {
 4. After adjusting all ten heuristic scores, compute the overall usability_score strictly as Σ(heuristic_score × weight) using the weights given above. Double-check the arithmetic before returning the final JSON.
 
 **Issue Reporting Rules:**
-1. PRIORITY: Report issues related to HIGH-WEIGHT heuristics FIRST (especially #4, #1, #5, #3)
-2. Return 1-3 most critical issues, sorted by:
+1. Return 1-3 most critical issues, sorted by:
    
    -  Severity (high > medium > low)
+2. Every issue MUST include a 'location' string that pinpoints the exact DOM element. Provide a selector or ID that uniquely identifies the element (e.g., 'form.signup-form input[name="email"]', 'main article.post-card:nth-of-type(2) button.cta'). Generic areas such as "navigation" or "footer" are not acceptable.
 
 **Location Format (CRITICAL for developers):**
 - MUST provide SPECIFIC DOM element identifiers for every issue
@@ -317,13 +1592,6 @@ document.addEventListener("DOMContentLoaded", function () {
   * "button.submit-btn in header <nav>"
   * "div.hero section.primary-callout button.cta-primary"
   * "img.gallery-item:nth-of-type(3) in <div class='gallery-grid'>"
-  * "footer.site-footer ul.nav-links a[href='/pricing']"
-- Bad examples (TOO VAGUE - avoid these):
-  * "Navigation area" ❌
-  * "Some buttons" ❌
-  * "Footer section" ❌
-  * "Throughout the page" ❌
-
 **Issue Discovery Rules:**
 - Report REAL issues only - do NOT fabricate problems if the page is well-designed
 - If reanalyzing, find DIFFERENT issues than before (avoid repeating the same problems)
@@ -405,34 +1673,13 @@ Return ONLY valid JSON with the specified structure.`;
             expectedInputs: [{ type: "text", languages: ["en"] }],
             expectedOutputs: [{ type: "text", languages: ["en"] }],
           };
-          // Prepare live stream container
-          const liveContainerId = "liveStream";
-          let live = document.getElementById(liveContainerId);
-          if (!live) {
-            live = document.createElement("div");
-            live.id = liveContainerId;
-            live.className = "live-stream";
-            try {
-              analyzeBtn.insertAdjacentElement("afterend", live);
-            } catch (_) {
-              document.body.appendChild(live);
-            }
-          }
-          live.style.whiteSpace = "pre-wrap";
-          live.style.fontFamily =
-            "ui-monospace, SFMono-Regular, Menlo, monospace";
-          live.style.marginTop = "8px";
-          live.textContent = "";
-          const onChunk = (delta) => {
-            if (!delta) return;
-            try {
-              live.textContent +=
-                typeof delta === "string" ? delta : String(delta);
-              live.scrollTop = live.scrollHeight;
-            } catch (_) {}
-          };
           const tModel0 = performance.now();
-          const response = await runPrompt(prompt, params, schema, onChunk);
+          const response = await runPrompt(
+            prompt,
+            params,
+            schema,
+            handleStreamChunk
+          );
           const tModel1 = performance.now();
           console.log(
             `[Heurix][Perf] model total (incl. wrapper): ${Math.round(
@@ -517,107 +1764,11 @@ Return ONLY valid JSON with the specified structure.`;
             }
 
             const tUi0 = performance.now();
-            // Update score number
-            const scoreEl = document.querySelector(".score-value");
-            scoreEl.textContent = String(Math.round(parsed.usability_score));
-
-            // Update gauge fill
-            const gaugeEl = document.querySelector(".gauge");
-            const clamped = Math.max(0, Math.min(100, parsed.usability_score));
-            gaugeEl.style.background = `radial-gradient(closest-side, #ecfdf5 72%, transparent 73% 100%), conic-gradient(#10b981 ${clamped}%, #e5e7eb 0)`;
-
-            // Replace Strengths list
-            const strengthsList = document.querySelector(
-              ".panel--success .panel-list"
-            );
-            if (strengthsList) {
-              strengthsList.innerHTML = "";
-              parsed.strengths.forEach((strength) => {
-                const li = document.createElement("li");
-                li.className = "success";
-                li.textContent = strength;
-                strengthsList.appendChild(li);
-              });
-            }
-
-            // Replace Issues list (titles only in summary view, using sorted issues)
-            const issuesList = document.querySelector(
-              ".panel--danger .panel-list"
-            );
-            issuesList.innerHTML = "";
-            sortedIssues.forEach((issue) => {
-              const li = document.createElement("li");
-              li.className = "danger";
-              const title =
-                typeof issue === "string"
-                  ? issue
-                  : issue.title || issue.description || "Issue";
-              li.textContent = title;
-              issuesList.appendChild(li);
-            });
-
-            // Show summary in info panel
-            const infoTitle = document.querySelector(
-              ".panel--info .panel-title"
-            );
-            if (infoTitle) infoTitle.textContent = "Summary";
-            const infoList = document.querySelector(".panel--info .panel-list");
-            if (infoList) {
-              infoList.innerHTML = "";
-              const li = document.createElement("li");
-              li.className = "info";
-              li.textContent = parsed.summary;
-              infoList.appendChild(li);
-            }
-
-            // Reveal results UI now
-            analyzeBtn.classList.remove("loading");
-            document.querySelector(".subtitle").style.display = "none";
-            analyzeBtn.style.display = "none";
-            document.querySelector(".instruction-text").style.display = "none";
-            results.classList.remove("hidden");
-            // Remove live stream container once final UI is ready
-            try {
-              if (live && live.parentNode) live.parentNode.removeChild(live);
-            } catch (_) {}
+            finalizeAnalysis(parsed, sortedIssues);
             const tUi1 = performance.now();
             console.log(
               `[Heurix][Perf] update UI summary: ${Math.round(tUi1 - tUi0)} ms`
             );
-
-            // Hook up Analyze Again
-            const againBtn = document.getElementById(analyzeAgainBtnId);
-            if (againBtn) {
-              // Rebind to re-run analysis immediately
-              againBtn.onclick = () => {
-                results.classList.add("hidden");
-                document.querySelector(".subtitle").style.display = "";
-                analyzeBtn.style.display = "";
-                document.querySelector(".instruction-text").style.display = "";
-                // Trigger fresh analysis
-                runAnalysis();
-              };
-            }
-
-            // Bind View Details button
-            const viewDetailsBtn = document.getElementById("viewDetailsBtn");
-            if (viewDetailsBtn) {
-              viewDetailsBtn.onclick = () => {
-                renderDetails(lastAnalysis, currentTab);
-                results.classList.add("hidden");
-                if (details) details.classList.remove("hidden");
-                if (headerBackBtn) headerBackBtn.style.display = "inline-flex";
-                if (headerBackBtn) {
-                  headerBackBtn.onclick = () => {
-                    if (details) details.classList.add("hidden");
-                    results.classList.remove("hidden");
-                    headerBackBtn.style.display = "none";
-                  };
-                }
-              };
-            }
-
-            // Stop here; skip fallback demo content
             console.log(
               `[Heurix][Perf] Analysis total: ${Math.round(
                 performance.now() - tTotal0
@@ -628,47 +1779,18 @@ Return ONLY valid JSON with the specified structure.`;
         } catch (error) {
           console.error("Error analyzing page:", error);
           alert("❌ Failed to analyze page. Please try again.");
-          try {
-            const live = document.getElementById("liveStream");
-            if (live && live.parentNode) live.parentNode.removeChild(live);
-          } catch (_) {}
+          showIntroView();
+        } finally {
+          setAnalyzeButtonLoading(false);
         }
-
-        // Here you can add your analysis logic
-        console.log("Analyzing page:", currentTab.url);
-
-        // Simulate analysis, then show example results
-        setTimeout(() => {
-          try {
-            const live = document.getElementById("liveStream");
-            if (live && live.parentNode) live.parentNode.removeChild(live);
-          } catch (_) {}
-          analyzeBtn.classList.remove("loading");
-          // Hide intro elements
-          document.querySelector(".subtitle").style.display = "none";
-          analyzeBtn.style.display = "none";
-          document.querySelector(".instruction-text").style.display = "none";
-          // Show results
-          results.classList.remove("hidden");
-          // Hook up Analyze Again
-          const againBtn = document.getElementById(analyzeAgainBtnId);
-          if (againBtn) {
-            againBtn.onclick = () => {
-              // Reset to intro view and immediately analyze again
-              results.classList.add("hidden");
-              document.querySelector(".subtitle").style.display = "";
-              analyzeBtn.style.display = "";
-              document.querySelector(".instruction-text").style.display = "";
-              runAnalysis();
-            };
-          }
-        }, 1200);
       }
     );
   }
 
   // Handle analyze button click
   analyzeBtn.addEventListener("click", runAnalysis);
+
+  setExportButtonEnabled(false);
 
   function renderDetails(analysis, currentTab) {
     if (!analysis) return;

@@ -215,6 +215,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  flex: 1;
+  min-width: 0;
 }
 .url-title {
   font-size: 14px;
@@ -227,6 +229,9 @@ body {
   font-size: 12px;
   color: #6b7280;
   line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .score-section {
@@ -394,6 +399,56 @@ body {
   box-shadow: 0 16px 40px rgba(124, 58, 237, 0.35);
 }
 
+.results.streaming .action-row button,
+.results.streaming .analyze-again-button {
+  pointer-events: none;
+}
+
+.skeleton-text {
+  position: relative;
+  display: inline-block;
+  overflow: hidden;
+  color: transparent !important;
+  background: rgba(255, 255, 255, 0.6);
+  border-radius: 6px;
+  min-height: 1em;
+}
+
+.skeleton-text::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0),
+    rgba(255, 255, 255, 0.85),
+    rgba(255, 255, 255, 0)
+  );
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.score-value.skeleton-text {
+  min-width: 48px;
+  min-height: 32px;
+}
+
+.panel-list li.skeleton-text {
+  width: 100%;
+  padding: 6px 0;
+}
+
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
 /* Loading State */
 .analyze-button.loading {
   pointer-events: none;
@@ -415,6 +470,12 @@ body {
   to {
     transform: rotate(360deg);
   }
+}
+
+.secondary-button[disabled],
+.analyze-again-button[disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* Responsive adjustments */
