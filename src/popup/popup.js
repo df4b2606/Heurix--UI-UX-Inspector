@@ -1281,9 +1281,10 @@ document.addEventListener("DOMContentLoaded", function () {
         lastAnalyzedTab,
         analysisHistory
       );
+      const preparedLines = preparePdfLinesForExport(lines);
       const logoImage = await getReportLogoImage();
       const pdfBytes = createPdfReport({
-        lines,
+        lines: preparedLines,
         logoImage,
       });
       const blob = new Blob([pdfBytes], { type: "application/pdf" });
@@ -1322,9 +1323,6 @@ document.addEventListener("DOMContentLoaded", function () {
 
     pushWrapped(lines, "Heurix - UX Audit Report");
     pushWrapped(lines, `Generated: ${now.toLocaleString()}`);
-    if (tabInfo?.title) {
-      pushWrapped(lines, `Page Title: ${tabInfo.title}`);
-    }
     if (tabInfo?.url) {
       pushWrapped(lines, `URL: ${tabInfo.url}`);
     }
@@ -1513,11 +1511,49 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function escapePdfText(text) {
-    return text
-      .replace(/[\u0000-\u001F\u007F-\uFFFF]/g, "?")
+    return String(text || "")
+      .replace(/[\u0000-\u001F\u007F]/g, "")
       .replace(/\\/g, "\\\\")
       .replace(/\(/g, "\\(")
       .replace(/\)/g, "\\)");
+  }
+
+  function preparePdfLinesForExport(lines) {
+    if (!Array.isArray(lines)) {
+      return [];
+    }
+
+    const chineseCharRegex =
+      /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u{20000}-\u{2EBFF}]/gu;
+    const pageTitleRegex = /^\s*(Generated:|URL:)/i;
+    const nonLatinRegex = /[^\u0000-\u007F]/g;
+
+    return lines.map((line) => {
+      const original = String(line ?? "");
+      if (!original) {
+        return "";
+      }
+
+      const leadingMatch = original.match(/^\s*/);
+      const leading = leadingMatch ? leadingMatch[0] : "";
+      const body = original.slice(leading.length);
+
+      if (pageTitleRegex.test(body)) {
+        return original;
+      }
+
+      const sanitizedBody = body
+        .replace(chineseCharRegex, "")
+        .replace(nonLatinRegex, "")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+
+      if (!sanitizedBody) {
+        return "";
+      }
+
+      return `${leading}${sanitizedBody}`;
+    });
   }
 
   let cachedReportLogoImage = null;
@@ -2263,7 +2299,7 @@ Do not show up any not English content in your summary, key issues and strengths
 - Treat 70 as a neutral, acceptable baseline when no major heuristics fail and there are clear strengths. Raise the score toward 85-95 for polished, well-structured experiences with only minor issues.
 - Reserve 50-69 for experiences with notable friction or multiple medium-severity problems. Drop below 50 only when severe usability failures exist across several heuristics.
 - When strong positives are detected (e.g., clear hierarchy, accessible buttons, high contrast, concise copy), reflect them by increasing the corresponding heuristic scores.
-
+-Do not always repeat some same score everytime!!Do your own analysis!!
 **Heuristic Evaluation Workflow (MANDATORY):**
 1. For each heuristic (1-10), inspect the provided context and explicitly decide whether the evidence shows clear strengths, minor friction, or severe problems.
 2. Begin every heuristic at a baseline score of 70. Adjust upward when the context demonstrates clear strengths for that heuristic; adjust downward only when concrete issues are indicated. Severe failures should push the score below 50.
