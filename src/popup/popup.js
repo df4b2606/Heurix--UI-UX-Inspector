@@ -3,6 +3,487 @@ let lastAnalysis; // store the latest parsed analysis for Details view
 let lastAnalyzedTab = null;
 let previousIssues = []; // store previously reported issues to avoid repetition
 
+const MAX_ANALYSIS_HISTORY_ENTRIES = 3;
+let analysisHistory = [];
+
+let scoreCacheByUrl = Object.create(null);
+let currentScoreCacheKey = null;
+let scoreCacheLoaded = false;
+let scoreCachePersistTimer = null;
+let currentContextSignature = null;
+let scoreLockActive = false;
+let scoreLockValue = null;
+let reanalysisScoreOverride = null;
+
+const SCORE_CACHE_STORAGE_KEY = "heurix.scoreCache.v1";
+const SCORE_CACHE_PERSIST_DEBOUNCE_MS = 200;
+
+let insightsCacheByUrl = Object.create(null);
+let insightsCacheLoaded = false;
+let insightsCachePersistTimer = null;
+
+const INSIGHTS_CACHE_STORAGE_KEY = "heurix.insightsCache.v1";
+const INSIGHTS_CACHE_PERSIST_DEBOUNCE_MS = 200;
+const INSIGHTS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function loadScoreCacheFromStorage() {
+  return new Promise((resolve) => {
+    if (!chrome || !chrome.storage || !chrome.storage.local) {
+      scoreCacheLoaded = true;
+      resolve();
+      return;
+    }
+
+    if (scoreCacheLoaded) {
+      resolve();
+      return;
+    }
+
+    try {
+      chrome.storage.local.get([SCORE_CACHE_STORAGE_KEY], (result) => {
+        try {
+          const stored = result && result[SCORE_CACHE_STORAGE_KEY];
+          if (stored && typeof stored === "object") {
+            const nextCache = Object.create(null);
+            Object.keys(stored).forEach((key) => {
+              const record = stored[key];
+              if (record && typeof record === "object") {
+                const numeric = Number(record.score);
+                if (Number.isFinite(numeric)) {
+                  const signature =
+                    typeof record.signature === "string"
+                      ? record.signature
+                      : "";
+                  nextCache[key] = { score: numeric, signature };
+                }
+              } else {
+                const numeric = Number(record);
+                if (Number.isFinite(numeric)) {
+                  nextCache[key] = { score: numeric, signature: "" };
+                }
+              }
+            });
+            scoreCacheByUrl = nextCache;
+          }
+        } catch (innerError) {
+          console.warn(
+            "[Heurix] Failed to parse stored score cache",
+            innerError
+          );
+        }
+        scoreCacheLoaded = true;
+        resolve();
+      });
+    } catch (error) {
+      console.warn("[Heurix] Failed to load score cache", error);
+      scoreCacheLoaded = true;
+      resolve();
+    }
+  });
+}
+
+function persistScoreCacheToStorage() {
+  if (!chrome || !chrome.storage || !chrome.storage.local) {
+    return;
+  }
+
+  const payload = {};
+  Object.keys(scoreCacheByUrl).forEach((key) => {
+    const entry = getCachedScoreForUrl(key);
+    if (entry && Number.isFinite(entry.score)) {
+      payload[key] = {
+        score: entry.score,
+        signature: entry.signature || "",
+      };
+    }
+  });
+
+  try {
+    chrome.storage.local.set({ [SCORE_CACHE_STORAGE_KEY]: payload }, () => {
+      const err = chrome.runtime && chrome.runtime.lastError;
+      if (err) {
+        console.warn("[Heurix] Failed to persist score cache", err);
+      }
+    });
+  } catch (error) {
+    console.warn("[Heurix] Exception while persisting score cache", error);
+  }
+}
+
+function schedulePersistScoreCache() {
+  if (scoreCachePersistTimer) {
+    clearTimeout(scoreCachePersistTimer);
+  }
+  scoreCachePersistTimer = setTimeout(() => {
+    scoreCachePersistTimer = null;
+    persistScoreCacheToStorage();
+  }, SCORE_CACHE_PERSIST_DEBOUNCE_MS);
+}
+
+function computeContextSignature(text) {
+  if (!text || typeof text !== "string") return "";
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash << 5) - hash + text.charCodeAt(i);
+    hash |= 0; // Convert to 32-bit integer
+  }
+  const normalized = (hash >>> 0).toString(16);
+  return `${text.length}:${normalized}`;
+}
+
+function normalizeUrlForScore(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const parsed = new URL(rawUrl);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const normalizedPath = pathname ? pathname : "/";
+    return `${parsed.origin}${normalizedPath}${parsed.search}`;
+  } catch (_) {
+    return rawUrl;
+  }
+}
+
+function getCachedScoreForUrl(key) {
+  if (!key) return null;
+  if (!Object.prototype.hasOwnProperty.call(scoreCacheByUrl, key)) {
+    return null;
+  }
+  const entry = scoreCacheByUrl[key];
+  if (entry == null) return null;
+  if (typeof entry === "number") {
+    const numeric = Number(entry);
+    return Number.isFinite(numeric) ? { score: numeric, signature: "" } : null;
+  }
+  const numeric = Number(entry?.score);
+  if (!Number.isFinite(numeric)) return null;
+  const signature = typeof entry?.signature === "string" ? entry.signature : "";
+  return { score: numeric, signature };
+}
+
+function storeScoreForUrl(key, score, signature = "") {
+  if (!key) return null;
+  const numeric = Number(score);
+  if (!Number.isFinite(numeric)) return null;
+  const normalizedSignature = typeof signature === "string" ? signature : "";
+  const prev = getCachedScoreForUrl(key);
+  if (
+    !prev ||
+    prev.score !== numeric ||
+    prev.signature !== normalizedSignature
+  ) {
+    scoreCacheByUrl[key] = {
+      score: numeric,
+      signature: normalizedSignature,
+    };
+    schedulePersistScoreCache();
+  }
+  return getCachedScoreForUrl(key);
+}
+
+function deleteScoreForUrl(key) {
+  if (!key) return false;
+  if (Object.prototype.hasOwnProperty.call(scoreCacheByUrl, key)) {
+    delete scoreCacheByUrl[key];
+    schedulePersistScoreCache();
+    return true;
+  }
+  return false;
+}
+
+function getCachedScoreOrFallback(key, fallbackScore, signature = "") {
+  const cached = getCachedScoreForUrl(key);
+  if (cached && cached.score != null) {
+    if (!signature || !cached.signature || cached.signature === signature) {
+      return cached.score;
+    }
+    deleteScoreForUrl(key);
+  }
+  const numeric = Number(fallbackScore);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function resolveAndStoreScore(key, score, signature = "") {
+  const cached = getCachedScoreForUrl(key);
+  const numeric = Number(score);
+  if (cached && cached.score != null) {
+    if (!signature || !cached.signature || cached.signature === signature) {
+      return cached.score;
+    }
+    deleteScoreForUrl(key);
+  }
+  if (!Number.isFinite(numeric)) return null;
+  const stored = storeScoreForUrl(key, numeric, signature);
+  return stored ? stored.score : null;
+}
+
+function sanitizeStrengthsForCache(value) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  value.forEach((item) => {
+    if (typeof item === "string") {
+      const trimmed = item.trim();
+      if (trimmed) result.push(trimmed);
+    }
+  });
+  return result;
+}
+
+function toPlainJson(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    return null;
+  }
+}
+
+function sanitizeIssuesForCache(value) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  value.forEach((item) => {
+    if (typeof item === "string") {
+      const trimmed = item.trim();
+      if (trimmed) result.push(trimmed);
+      return;
+    }
+    if (item && typeof item === "object") {
+      const plain = toPlainJson(item);
+      if (plain && typeof plain === "object") {
+        result.push(plain);
+      }
+    }
+  });
+  return result;
+}
+
+function sanitizeSummaryForCache(value) {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function sanitizeSignatureForCache(value) {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function cloneInsightsArray(value) {
+  if (!Array.isArray(value)) return [];
+  const clone = toPlainJson(value);
+  return Array.isArray(clone) ? clone : [];
+}
+
+function normalizeAnalysisEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const timestamp = Number(entry.timestamp);
+  const strengths = sanitizeStrengthsForCache(entry.strengths);
+  const issues = cloneInsightsArray(entry.issues);
+  const summary = typeof entry.summary === "string" ? entry.summary.trim() : "";
+  const usabilityScoreRaw = Number(entry.usability_score);
+
+  return {
+    timestamp:
+      Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now(),
+    usability_score: Number.isFinite(usabilityScoreRaw)
+      ? usabilityScoreRaw
+      : null,
+    summary,
+    strengths,
+    issues,
+  };
+}
+
+function replaceAnalysisHistory(entries) {
+  if (!Array.isArray(entries)) {
+    analysisHistory = [];
+    return;
+  }
+  const normalized = entries
+    .map((entry) => normalizeAnalysisEntry(entry))
+    .filter(Boolean);
+  analysisHistory = normalized.slice(-MAX_ANALYSIS_HISTORY_ENTRIES);
+}
+
+function appendAnalysisHistory(entry) {
+  const normalized = normalizeAnalysisEntry(entry);
+  if (!normalized) return;
+  analysisHistory = [...analysisHistory, normalized].slice(
+    -MAX_ANALYSIS_HISTORY_ENTRIES
+  );
+}
+
+function loadInsightsCacheFromStorage() {
+  return new Promise((resolve) => {
+    if (!chrome || !chrome.storage || !chrome.storage.local) {
+      insightsCacheLoaded = true;
+      resolve();
+      return;
+    }
+
+    if (insightsCacheLoaded) {
+      resolve();
+      return;
+    }
+
+    try {
+      chrome.storage.local.get([INSIGHTS_CACHE_STORAGE_KEY], (result) => {
+        try {
+          const stored = result && result[INSIGHTS_CACHE_STORAGE_KEY];
+          if (stored && typeof stored === "object") {
+            const nextCache = Object.create(null);
+            const now = Date.now();
+            Object.keys(stored).forEach((key) => {
+              const record = stored[key];
+              if (!record || typeof record !== "object") {
+                return;
+              }
+              const timestamp = Number(record.timestamp);
+              if (!Number.isFinite(timestamp)) {
+                return;
+              }
+              if (now - timestamp > INSIGHTS_CACHE_TTL_MS) {
+                return;
+              }
+              const strengths = sanitizeStrengthsForCache(record.strengths);
+              const issues = sanitizeIssuesForCache(record.issues);
+              const summary = sanitizeSummaryForCache(record.summary);
+              const signature = sanitizeSignatureForCache(record.signature);
+              if (!signature) {
+                return;
+              }
+              nextCache[key] = {
+                strengths,
+                issues,
+                summary,
+                timestamp,
+                signature,
+              };
+            });
+            insightsCacheByUrl = nextCache;
+          }
+        } catch (innerError) {
+          console.warn("[Heurix] Failed to parse insights cache", innerError);
+        }
+        insightsCacheLoaded = true;
+        resolve();
+      });
+    } catch (error) {
+      console.warn("[Heurix] Failed to load insights cache", error);
+      insightsCacheLoaded = true;
+      resolve();
+    }
+  });
+}
+
+function persistInsightsCacheToStorage() {
+  if (!chrome || !chrome.storage || !chrome.storage.local) {
+    return;
+  }
+
+  const payload = {};
+  const now = Date.now();
+  Object.keys(insightsCacheByUrl).forEach((key) => {
+    const entry = insightsCacheByUrl[key];
+    if (!entry || typeof entry !== "object") {
+      return;
+    }
+    const timestamp = Number(entry.timestamp);
+    if (!Number.isFinite(timestamp)) {
+      return;
+    }
+    if (now - timestamp > INSIGHTS_CACHE_TTL_MS) {
+      delete insightsCacheByUrl[key];
+      return;
+    }
+    payload[key] = {
+      strengths: sanitizeStrengthsForCache(entry.strengths),
+      issues: sanitizeIssuesForCache(entry.issues),
+      summary: sanitizeSummaryForCache(entry.summary),
+      timestamp,
+      signature: sanitizeSignatureForCache(entry.signature),
+    };
+  });
+
+  try {
+    chrome.storage.local.set({ [INSIGHTS_CACHE_STORAGE_KEY]: payload }, () => {
+      const err = chrome.runtime && chrome.runtime.lastError;
+      if (err) {
+        console.warn("[Heurix] Failed to persist insights cache", err);
+      }
+    });
+  } catch (error) {
+    console.warn("[Heurix] Exception while persisting insights cache", error);
+  }
+}
+
+function schedulePersistInsightsCache() {
+  if (insightsCachePersistTimer) {
+    clearTimeout(insightsCachePersistTimer);
+  }
+  insightsCachePersistTimer = setTimeout(() => {
+    insightsCachePersistTimer = null;
+    persistInsightsCacheToStorage();
+  }, INSIGHTS_CACHE_PERSIST_DEBOUNCE_MS);
+}
+
+function getCachedInsightsForUrl(key) {
+  if (!key) return null;
+  if (!Object.prototype.hasOwnProperty.call(insightsCacheByUrl, key)) {
+    return null;
+  }
+  const entry = insightsCacheByUrl[key];
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  const timestamp = Number(entry.timestamp);
+  if (!Number.isFinite(timestamp)) {
+    deleteInsightsForUrl(key);
+    return null;
+  }
+  if (Date.now() - timestamp > INSIGHTS_CACHE_TTL_MS) {
+    deleteInsightsForUrl(key);
+    return null;
+  }
+  return {
+    strengths: cloneInsightsArray(entry.strengths),
+    issues: cloneInsightsArray(entry.issues),
+    summary: sanitizeSummaryForCache(entry.summary),
+    timestamp,
+    signature: sanitizeSignatureForCache(entry.signature),
+  };
+}
+
+function storeInsightsForUrl(key, data) {
+  if (!key || !data || typeof data !== "object") {
+    return null;
+  }
+  const strengths = sanitizeStrengthsForCache(data.strengths);
+  const issues = sanitizeIssuesForCache(data.issues);
+  const summary = sanitizeSummaryForCache(data.summary);
+  const signature = sanitizeSignatureForCache(data.signature);
+  if (!signature) {
+    return null;
+  }
+  const timestamp = Date.now();
+  insightsCacheByUrl[key] = {
+    strengths,
+    issues,
+    summary,
+    timestamp,
+    signature,
+  };
+  schedulePersistInsightsCache();
+  return getCachedInsightsForUrl(key);
+}
+
+function deleteInsightsForUrl(key) {
+  if (!key) return false;
+  if (Object.prototype.hasOwnProperty.call(insightsCacheByUrl, key)) {
+    delete insightsCacheByUrl[key];
+    schedulePersistInsightsCache();
+    return true;
+  }
+  return false;
+}
+
 // Nielsen's 10 Heuristics weights (sum to 1.0)
 const HEURISTIC_WEIGHTS = {
   1: 0.13, // Visibility of System Status
@@ -286,10 +767,82 @@ document.addEventListener("DOMContentLoaded", function () {
     summaryListEl.appendChild(li);
   }
 
+  function applyCachedInsightsToUi(cacheKey, cachedData, tabInfo) {
+    if (!cachedData) return false;
+
+    prepareResultsSkeleton({ reset: true });
+
+    const strengths = Array.isArray(cachedData.strengths)
+      ? cachedData.strengths
+      : [];
+    const issues = Array.isArray(cachedData.issues) ? cachedData.issues : [];
+    const summaryText =
+      typeof cachedData.summary === "string" ? cachedData.summary : "";
+
+    renderStrengths(strengths, { force: true });
+    renderIssues(issues, { force: true });
+    renderSummary(summaryText, { force: true });
+
+    let cachedScore = null;
+    if (cacheKey) {
+      const scoreEntry = getCachedScoreForUrl(cacheKey);
+      if (scoreEntry && Number.isFinite(scoreEntry.score)) {
+        cachedScore = scoreEntry.score;
+        updateScoreDisplay(cachedScore, { animate: false });
+      }
+    }
+
+    if (results) {
+      results.classList.remove("streaming");
+      results.removeAttribute("aria-busy");
+      results.classList.remove("hidden");
+    }
+    if (scoreValueEl) {
+      scoreValueEl.classList.remove("skeleton-text");
+    }
+    if (viewDetailsBtn) viewDetailsBtn.removeAttribute("disabled");
+    if (analyzeAgainBtn) analyzeAgainBtn.removeAttribute("disabled");
+    setExportButtonEnabled(true);
+
+    const strengthsForState = sanitizeStrengthsForCache(strengths);
+    const issuesForState = cloneInsightsArray(issues);
+    const summaryForState = sanitizeSummaryForCache(summaryText);
+
+    const cachedAnalysis = {
+      usability_score: cachedScore,
+      strengths: strengthsForState,
+      issues: issuesForState,
+      summary: summaryForState,
+      timestamp: Date.now(),
+    };
+
+    lastAnalysis = cachedAnalysis;
+    replaceAnalysisHistory([cachedAnalysis]);
+
+    if (tabInfo) {
+      lastAnalyzedTab = {
+        title: tabInfo.title || "",
+        url: tabInfo.url || "",
+      };
+    }
+
+    streamApplied = {
+      usability_score: cachedScore,
+      strengths: strengthsForState,
+      issues: issuesForState,
+      summary: summaryForState,
+    };
+
+    skeletonDisplayed = true;
+
+    return true;
+  }
+
   function applyStreamingState(nextState) {
     const updated = { ...streamApplied };
 
     if (
+      !scoreLockActive &&
       typeof nextState.usability_score === "number" &&
       nextState.usability_score !== streamApplied.usability_score
     ) {
@@ -340,7 +893,15 @@ document.addEventListener("DOMContentLoaded", function () {
       /"usability_score"\s*:\s*([0-9]+(?:\.[0-9]+)?)/
     );
     if (scoreMatch) {
-      nextState.usability_score = Number(scoreMatch[1]);
+      const fallbackScore = Number(scoreMatch[1]);
+      const resolvedScore = getCachedScoreOrFallback(
+        currentScoreCacheKey,
+        fallbackScore,
+        currentContextSignature
+      );
+      if (resolvedScore != null) {
+        nextState.usability_score = resolvedScore;
+      }
     }
 
     const summaryMatch = streamBuffer.match(
@@ -382,7 +943,11 @@ document.addEventListener("DOMContentLoaded", function () {
       (typeof nextState.summary === "string" && nextState.summary);
 
     if (!skeletonDisplayed && hasRenderableData) {
-      prepareResultsSkeleton({ reset: false });
+      prepareResultsSkeleton({
+        reset: false,
+        preserveScore: scoreLockActive,
+        lockedScore: scoreLockValue,
+      });
     }
 
     applyStreamingState(nextState);
@@ -390,14 +955,29 @@ document.addEventListener("DOMContentLoaded", function () {
 
   function finalizeAnalysis(parsed, sortedIssues) {
     if (!skeletonDisplayed) {
-      prepareResultsSkeleton({ reset: false });
+      prepareResultsSkeleton({
+        reset: false,
+        preserveScore: scoreLockActive,
+        lockedScore: scoreLockValue,
+      });
+    }
+    if (reanalysisScoreOverride != null) {
+      parsed.usability_score = reanalysisScoreOverride;
     }
     if (parsed && typeof parsed.usability_score === "number") {
-      const alreadyHadScore = streamApplied.usability_score != null;
-      updateScoreDisplay(parsed.usability_score, {
-        animate: !alreadyHadScore,
-      });
-      streamApplied.usability_score = parsed.usability_score;
+      const resolvedScore = resolveAndStoreScore(
+        currentScoreCacheKey,
+        parsed.usability_score,
+        currentContextSignature
+      );
+      if (typeof resolvedScore === "number" && Number.isFinite(resolvedScore)) {
+        parsed.usability_score = resolvedScore;
+        const alreadyHadScore = streamApplied.usability_score != null;
+        updateScoreDisplay(resolvedScore, {
+          animate: !alreadyHadScore,
+        });
+        streamApplied.usability_score = resolvedScore;
+      }
     }
 
     const strengthsArray = Array.isArray(parsed?.strengths)
@@ -414,6 +994,30 @@ document.addEventListener("DOMContentLoaded", function () {
       typeof parsed?.summary === "string" ? parsed.summary : "";
     renderSummary(summaryText, { force: true });
     streamApplied.summary = summaryText;
+
+    if (currentScoreCacheKey) {
+      storeInsightsForUrl(currentScoreCacheKey, {
+        strengths: strengthsArray,
+        issues: finalIssues,
+        summary: summaryText,
+        signature: currentContextSignature,
+      });
+    }
+
+    const finalizedAnalysis = {
+      usability_score: parsed?.usability_score ?? null,
+      strengths: strengthsArray,
+      issues: finalIssues,
+      summary: summaryText,
+      timestamp: Date.now(),
+    };
+
+    lastAnalysis = finalizedAnalysis;
+    appendAnalysisHistory(finalizedAnalysis);
+
+    scoreLockActive = false;
+    scoreLockValue = null;
+    reanalysisScoreOverride = null;
 
     if (results) {
       results.classList.remove("streaming");
@@ -460,33 +1064,69 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   }
 
-  function enterAnalysisPendingState() {
+  function setProcessingMessage(listElement, baseClass) {
+    if (!listElement) return;
+    listElement.innerHTML = "";
+    const li = document.createElement("li");
+    li.className = baseClass
+      ? `${baseClass} skeleton-text processing-note`
+      : "skeleton-text processing-note";
+    li.textContent = "AI is working on it";
+    listElement.appendChild(li);
+  }
+
+  function enterAnalysisPendingState({
+    preserveScore = false,
+    lockedScore = null,
+  } = {}) {
     skeletonDisplayed = false;
     resetStreamState();
-    lastAnalysis = null;
-    if (results) {
-      results.classList.add("hidden");
-      results.classList.remove("streaming");
-      results.removeAttribute("aria-busy");
+    streamApplied.usability_score = preserveScore ? lockedScore : null;
+    if (!preserveScore) {
+      lastAnalysis = null;
+      analysisHistory = [];
+      if (results) {
+        results.classList.add("hidden");
+        results.classList.remove("streaming");
+        results.removeAttribute("aria-busy");
+      }
+      if (subtitleEl) subtitleEl.style.display = "";
+      if (instructionEl) {
+        instructionEl.style.display = "none";
+        instructionEl.textContent = instructionDefaultText;
+      }
+      if (analyzeBtn) {
+        analyzeBtn.style.display = "";
+      }
+    } else {
+      if (results) {
+        results.classList.remove("hidden");
+        results.classList.add("streaming");
+        results.setAttribute("aria-busy", "true");
+      }
+      if (scoreValueEl && lockedScore != null) {
+        updateScoreDisplay(lockedScore, { animate: false });
+      }
+      if (strengthsListEl) setSkeletonList(strengthsListEl, 3, "success");
+      if (issuesListEl) setProcessingMessage(issuesListEl, "danger");
+      if (summaryTitleEl) summaryTitleEl.textContent = "Summary";
+      if (summaryListEl) setProcessingMessage(summaryListEl, "info");
     }
     if (details) details.classList.add("hidden");
     if (headerBackBtn) headerBackBtn.style.display = "none";
-    if (subtitleEl) subtitleEl.style.display = "";
-    if (instructionEl) {
-      instructionEl.style.display = "none";
-      instructionEl.textContent = instructionDefaultText;
-    }
-    if (analyzeBtn) {
-      analyzeBtn.style.display = "";
-    }
     if (viewDetailsBtn) viewDetailsBtn.setAttribute("disabled", "disabled");
     if (analyzeAgainBtn) analyzeAgainBtn.setAttribute("disabled", "disabled");
     setExportButtonEnabled(false);
   }
 
-  function prepareResultsSkeleton({ reset = true } = {}) {
+  function prepareResultsSkeleton({
+    reset = true,
+    preserveScore = false,
+    lockedScore = null,
+  } = {}) {
     if (reset) {
       resetStreamState();
+      streamApplied.usability_score = preserveScore ? lockedScore : null;
     }
     skeletonDisplayed = true;
     if (subtitleEl) subtitleEl.style.display = "none";
@@ -502,20 +1142,28 @@ document.addEventListener("DOMContentLoaded", function () {
       results.classList.add("streaming");
       results.setAttribute("aria-busy", "true");
     }
-    if (scoreValueEl) {
-      scoreValueEl.textContent = "…";
-      scoreValueEl.classList.add("skeleton-text");
-      scoreValueEl.style.color = "";
+    if (!preserveScore) {
+      if (scoreValueEl) {
+        scoreValueEl.textContent = "…";
+        scoreValueEl.classList.add("skeleton-text");
+        scoreValueEl.style.color = "";
+      }
+      if (gaugeEl) {
+        gaugeEl.style.background =
+          "radial-gradient(closest-side, #f3f4f6 72%, transparent 73% 100%), conic-gradient(#e5e7eb 0%, #e5e7eb 0)";
+        gaugeEl.style.boxShadow = "0 20px 60px rgba(107, 114, 128, 0.16)";
+      }
+      setSkeletonList(strengthsListEl, 3, "success");
+      setProcessingMessage(issuesListEl, "danger");
+      if (summaryTitleEl) summaryTitleEl.textContent = "Summary";
+      setProcessingMessage(summaryListEl, "info");
+    } else if (lockedScore != null) {
+      updateScoreDisplay(lockedScore, { animate: false });
+      setSkeletonList(strengthsListEl, 3, "success");
+      setProcessingMessage(issuesListEl, "danger");
+      if (summaryTitleEl) summaryTitleEl.textContent = "Summary";
+      setProcessingMessage(summaryListEl, "info");
     }
-    if (gaugeEl) {
-      gaugeEl.style.background =
-        "radial-gradient(closest-side, #f3f4f6 72%, transparent 73% 100%), conic-gradient(#e5e7eb 0%, #e5e7eb 0)";
-      gaugeEl.style.boxShadow = "0 20px 60px rgba(107, 114, 128, 0.16)";
-    }
-    setSkeletonList(strengthsListEl, 3, "success");
-    setSkeletonList(issuesListEl, 3, "danger");
-    if (summaryTitleEl) summaryTitleEl.textContent = "Summary";
-    setSkeletonList(summaryListEl, 1, "info");
     if (viewDetailsBtn) viewDetailsBtn.setAttribute("disabled", "disabled");
     if (analyzeAgainBtn) analyzeAgainBtn.setAttribute("disabled", "disabled");
     setExportButtonEnabled(false);
@@ -590,8 +1238,10 @@ document.addEventListener("DOMContentLoaded", function () {
 
   if (analyzeAgainBtn) {
     analyzeAgainBtn.addEventListener("click", () => {
-      showIntroView();
-      runAnalysis();
+      if (currentScoreCacheKey) {
+        deleteInsightsForUrl(currentScoreCacheKey);
+      }
+      runAnalysis({ forceReanalysis: true, preserveScore: true });
     });
   }
 
@@ -626,17 +1276,15 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     try {
-      const lines = buildReportLines(lastAnalysis, lastAnalyzedTab);
+      const lines = buildReportLines(
+        lastAnalysis,
+        lastAnalyzedTab,
+        analysisHistory
+      );
       const logoImage = await getReportLogoImage();
-      const rawScore = Number(lastAnalysis.usability_score);
-      const normalizedScore = Number.isFinite(rawScore)
-        ? Math.max(0, Math.min(100, rawScore))
-        : 0;
-      const scoreRingImage = createScoreRingImage(normalizedScore);
       const pdfBytes = createPdfReport({
         lines,
         logoImage,
-        scoreRingImage,
       });
       const blob = new Blob([pdfBytes], { type: "application/pdf" });
       const url = URL.createObjectURL(blob);
@@ -668,7 +1316,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   const MAX_LINE_LENGTH = 90;
 
-  function buildReportLines(analysis, tabInfo) {
+  function buildReportLines(latestAnalysis, tabInfo, history = []) {
     const lines = [];
     const now = new Date();
 
@@ -681,51 +1329,123 @@ document.addEventListener("DOMContentLoaded", function () {
       pushWrapped(lines, `URL: ${tabInfo.url}`);
     }
 
-    lines.push("");
-    pushWrapped(
-      lines,
-      `Usability Score: ${Math.round(analysis.usability_score || 0)} / 100`
-    );
+    const normalizedLatest = normalizeAnalysisEntry(latestAnalysis);
+    const latestScore = normalizedLatest?.usability_score;
+    const resolvedScore = Number.isFinite(Number(latestScore))
+      ? Number(latestScore)
+      : 0;
 
-    if (analysis.summary) {
+    lines.push("");
+    pushWrapped(lines, `Usability Score: ${Math.round(resolvedScore)} / 100`);
+
+    const latestSummary = normalizedLatest?.summary || "";
+    if (latestSummary) {
       lines.push("");
       pushWrapped(lines, "Summary:");
-      pushWrapped(lines, analysis.summary, 2);
+      pushWrapped(lines, latestSummary, 2);
     }
 
-    if (Array.isArray(analysis.strengths) && analysis.strengths.length > 0) {
-      lines.push("");
-      pushWrapped(lines, "Strengths:");
-      analysis.strengths.forEach((strength, index) => {
-        pushWrapped(lines, `${index + 1}. ${strength}`, 2);
+    let historyEntries = Array.isArray(history)
+      ? history.map((entry) => normalizeAnalysisEntry(entry)).filter(Boolean)
+      : [];
+
+    if (normalizedLatest) {
+      const hasLatest = historyEntries.some(
+        (entry) => entry.timestamp === normalizedLatest.timestamp
+      );
+      if (!hasLatest) {
+        historyEntries = [...historyEntries, normalizedLatest];
+      }
+    }
+
+    if (!historyEntries.length && normalizedLatest) {
+      historyEntries = [normalizedLatest];
+    }
+
+    const orderedHistory = historyEntries
+      .slice(-MAX_ANALYSIS_HISTORY_ENTRIES)
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const pushStrengthsSection = (strengths, indent) => {
+      if (!Array.isArray(strengths) || strengths.length === 0) {
+        pushWrapped(lines, "Strengths: 无记录", indent);
+        return;
+      }
+      pushWrapped(lines, "Strengths:", indent);
+      strengths.forEach((strength, index) => {
+        pushWrapped(lines, `${index + 1}. ${strength}`, indent + 2);
       });
-    }
+    };
 
-    if (Array.isArray(analysis.issues) && analysis.issues.length > 0) {
-      lines.push("");
-      pushWrapped(lines, "Key Issues:");
-      analysis.issues.forEach((issue, index) => {
-        const titleLine = `${index + 1}. ${issue.title || "Issue"} [${(
-          issue.severity || ""
-        ).toUpperCase()}]`;
-        pushWrapped(lines, titleLine.replace(/\s+/g, " "), 2);
-        if (issue.description) {
-          pushWrapped(lines, `Description: ${issue.description}`, 4);
-        }
-        if (issue.location) {
-          pushWrapped(lines, `Location: ${issue.location}`, 4);
-        }
-        if (issue.impact) {
-          pushWrapped(lines, `Impact: ${issue.impact}`, 4);
-        }
-        if (issue.recommendation) {
-          pushWrapped(lines, `Recommendation: ${issue.recommendation}`, 4);
+    const pushIssuesSection = (issues, indent) => {
+      if (!Array.isArray(issues) || issues.length === 0) {
+        pushWrapped(lines, "Key Issues: 无记录", indent);
+        return;
+      }
+      pushWrapped(lines, "Key Issues:", indent);
+      issues.forEach((issue, index) => {
+        if (issue && typeof issue === "object" && !Array.isArray(issue)) {
+          const severity =
+            typeof issue.severity === "string"
+              ? issue.severity.toUpperCase()
+              : "";
+          const titleLine = `${index + 1}. ${issue.title || "Issue"}${
+            severity ? ` [${severity}]` : ""
+          }`;
+          pushWrapped(lines, titleLine.replace(/\s+/g, " "), indent + 2);
+          if (issue.description) {
+            pushWrapped(lines, `Description: ${issue.description}`, indent + 4);
+          }
+          if (issue.location) {
+            pushWrapped(lines, `Location: ${issue.location}`, indent + 4);
+          }
+          if (issue.impact) {
+            pushWrapped(lines, `Impact: ${issue.impact}`, indent + 4);
+          }
+          if (issue.recommendation) {
+            pushWrapped(
+              lines,
+              `Recommendation: ${issue.recommendation}`,
+              indent + 4
+            );
+          }
+        } else {
+          pushWrapped(
+            lines,
+            `${index + 1}. ${String(issue ?? "Issue")}`,
+            indent + 2
+          );
         }
         lines.push("");
       });
       while (lines.length && lines[lines.length - 1] === "") {
         lines.pop();
       }
+    };
+
+    if (orderedHistory.length > 0) {
+      lines.push("");
+      pushWrapped(lines, "分析历史（最近三次）:");
+      orderedHistory.forEach((entry, index) => {
+        lines.push("");
+        const ordinal = index + 1;
+        const timestampLabel = new Date(
+          entry.timestamp || Date.now()
+        ).toLocaleString();
+        const isLatest = index === orderedHistory.length - 1;
+        const headerLabel = `第${ordinal}次分析${isLatest ? "（最新）" : ""}`;
+        pushWrapped(lines, `${headerLabel} - ${timestampLabel}`);
+        const entryScore = Number(entry.usability_score);
+        pushWrapped(
+          lines,
+          `Usability Score: ${Math.round(
+            Number.isFinite(entryScore) ? entryScore : 0
+          )} / 100`,
+          2
+        );
+        pushStrengthsSection(entry.strengths, 2);
+        pushIssuesSection(entry.issues, 2);
+      });
     }
 
     return lines;
@@ -871,86 +1591,6 @@ document.addEventListener("DOMContentLoaded", function () {
       data: dataUrlToUint8Array(dataUrl),
       width: canvasWidth,
       height: canvasHeight,
-    };
-  }
-
-  function createScoreRingImage(score) {
-    const normalized = Math.max(0, Math.min(100, Number(score) || 0));
-    const palette = getScoreColor(normalized) || {};
-    const trackColor = palette.track || "#e5e7eb";
-    const ringColor = palette.primary || "#2563eb";
-    const textColor = palette.text || "#0f172a";
-
-    const size = 260;
-    const ringWidth = 28;
-    const canvas = document.createElement("canvas");
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      return null;
-    }
-
-    const center = size / 2;
-    const radius = center - ringWidth;
-
-    ctx.clearRect(0, 0, size, size);
-
-    const backgroundGradient = ctx.createRadialGradient(
-      center,
-      center,
-      radius * 0.15,
-      center,
-      center,
-      radius * 1.1
-    );
-    backgroundGradient.addColorStop(0, "#ffffff");
-    backgroundGradient.addColorStop(1, "#f8fafc");
-    ctx.fillStyle = backgroundGradient;
-    ctx.fillRect(0, 0, size, size);
-
-    ctx.lineWidth = ringWidth;
-    ctx.lineCap = "round";
-
-    ctx.strokeStyle = trackColor;
-    ctx.beginPath();
-    ctx.arc(center, center, radius, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.strokeStyle = ringColor;
-    ctx.beginPath();
-    ctx.arc(
-      center,
-      center,
-      radius,
-      -Math.PI / 2,
-      -Math.PI / 2 + (Math.PI * 2 * normalized) / 100
-    );
-    ctx.stroke();
-
-    ctx.fillStyle = textColor;
-    ctx.font = "bold 68px 'Arial'";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(String(Math.round(normalized)), center, center - 6);
-
-    ctx.fillStyle = "#4b5563";
-    ctx.font = "24px 'Arial'";
-    ctx.fillText("/100", center, center + 38);
-
-    ctx.fillStyle = "#4b5563";
-    ctx.font = "22px 'Arial'";
-    ctx.fillText("Usability Score", center, center + radius - 30);
-
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
-
-    return {
-      data: dataUrlToUint8Array(dataUrl),
-      width: canvas.width,
-      height: canvas.height,
-      displayWidth: 160,
-      displayHeight: 160,
-      resourceName: "/Im2",
     };
   }
 
@@ -1380,20 +2020,49 @@ document.addEventListener("DOMContentLoaded", function () {
     return concatUint8Arrays(segments);
   }
 
-  async function runAnalysis() {
+  async function runAnalysis(options = {}) {
+    const forceReanalysis = options?.forceReanalysis === true;
+    const preserveScore = options?.preserveScore === true;
+    const lockedScoreCandidateRaw = preserveScore
+      ? streamApplied?.usability_score ?? lastAnalysis?.usability_score ?? null
+      : null;
+    const lockedScoreCandidate =
+      lockedScoreCandidateRaw != null &&
+      Number.isFinite(Number(lockedScoreCandidateRaw))
+        ? Number(lockedScoreCandidateRaw)
+        : null;
+    if (preserveScore && lockedScoreCandidate != null) {
+      scoreLockActive = true;
+      scoreLockValue = lockedScoreCandidate;
+      reanalysisScoreOverride = lockedScoreCandidate;
+    } else {
+      scoreLockActive = false;
+      scoreLockValue = null;
+      reanalysisScoreOverride = null;
+    }
     setAnalyzeButtonLoading(true);
-    enterAnalysisPendingState();
     const tTotal0 = performance.now();
+    currentScoreCacheKey = null;
+    currentContextSignature = null;
 
     // Query the active tab
     chrome.tabs.query(
       { active: true, currentWindow: true },
       async function (tabs) {
         const currentTab = tabs[0];
+        if (!currentTab) {
+          console.warn("[Heurix] No active tab found for analysis");
+          setAnalyzeButtonLoading(false);
+          return;
+        }
+        currentScoreCacheKey = normalizeUrlForScore(currentTab?.url || "");
         lastAnalyzedTab = {
           title: currentTab?.title || "",
           url: currentTab?.url || "",
         };
+        const cachedInsights = !forceReanalysis
+          ? getCachedInsightsForUrl(currentScoreCacheKey)
+          : null;
 
         // Ask content script for structured page info
         const tMsg0 = performance.now();
@@ -1543,6 +2212,7 @@ document.addEventListener("DOMContentLoaded", function () {
           null,
           0
         );
+        currentContextSignature = computeContextSignature(structuredSummary);
         const tCtx1 = performance.now();
         console.log(
           `[Heurix][Perf] build structured context: ${Math.round(
@@ -1553,9 +2223,32 @@ document.addEventListener("DOMContentLoaded", function () {
           `[Heurix][Perf] build structured context: size: ${structuredSummary.length} chars`
         );
 
+        if (!forceReanalysis && cachedInsights) {
+          const cachedSignature = cachedInsights.signature || "";
+          if (cachedSignature && cachedSignature === currentContextSignature) {
+            applyCachedInsightsToUi(
+              currentScoreCacheKey,
+              cachedInsights,
+              lastAnalyzedTab
+            );
+            scoreLockActive = false;
+            scoreLockValue = null;
+            reanalysisScoreOverride = null;
+            setAnalyzeButtonLoading(false);
+            return;
+          }
+          deleteInsightsForUrl(currentScoreCacheKey);
+        }
+
+        enterAnalysisPendingState({
+          preserveScore: scoreLockActive,
+          lockedScore: scoreLockValue,
+        });
+
         const systemInstructions = `You are a UX/UI expert evaluating web pages based on Nielsen's 10 Usability Heuristics. Your goal is to help the developers improve the UI design and usability of the page.
 
 **Scoring Rules (CRITICAL):**
+Do not show up any not English content in your summary, key issues and strengths response!
 1. Calculate the overall usability_score using STRICTLY these weighted heuristics (weights sum to 1.0):
    ${Object.entries(HEURISTIC_WEIGHTS)
      .sort(([, a], [, b]) => b - a) // Sort by weight descending
@@ -1753,6 +2446,18 @@ Return ONLY valid JSON with the specified structure.`;
               );
             });
 
+            const resolvedScore = resolveAndStoreScore(
+              currentScoreCacheKey,
+              parsed.usability_score,
+              currentContextSignature
+            );
+            if (
+              typeof resolvedScore === "number" &&
+              Number.isFinite(resolvedScore)
+            ) {
+              parsed.usability_score = resolvedScore;
+            }
+
             // Save sorted analysis for Details view
             lastAnalysis = { ...parsed, issues: sortedIssues };
 
@@ -1788,7 +2493,7 @@ Return ONLY valid JSON with the specified structure.`;
   }
 
   // Handle analyze button click
-  analyzeBtn.addEventListener("click", runAnalysis);
+  analyzeBtn.addEventListener("click", () => runAnalysis());
 
   setExportButtonEnabled(false);
 
@@ -1887,6 +2592,23 @@ Return ONLY valid JSON with the specified structure.`;
     }
   });
 
-  // Auto-run analysis when popup opens
-  runAnalysis();
+  window.addEventListener("beforeunload", () => {
+    if (scoreCachePersistTimer) {
+      clearTimeout(scoreCachePersistTimer);
+      scoreCachePersistTimer = null;
+    }
+    if (insightsCachePersistTimer) {
+      clearTimeout(insightsCachePersistTimer);
+      insightsCachePersistTimer = null;
+    }
+    persistScoreCacheToStorage();
+    persistInsightsCacheToStorage();
+  });
+
+  Promise.all([
+    loadScoreCacheFromStorage(),
+    loadInsightsCacheFromStorage(),
+  ]).finally(() => {
+    runAnalysis();
+  });
 });
